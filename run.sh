@@ -106,4 +106,4 @@ python3 vuln_hunter.py --setup --workdir /opt/vuln-hunter
 
 echo "[*] Discovering vulnerabilities in kvm/qemu error handling."
 sleep 5
-python3 vuln_hunter.py --scan 
+python3 hunter.py
