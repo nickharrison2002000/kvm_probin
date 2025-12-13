@@ -110,6 +110,40 @@ cd /opt/vuln-hunter/A*
 make install
 cd /root/kvm_probin/hunter
 
-echo "[*] Discovering vulnerabilities in kvm/qemu error handling."
+echo "[*] Initiating clean slate protocol."
 sleep 5
-python3 hunter.py
+dmesg -c
+echo "[*] Preparing variouse kvm/qemu device emulation tests on error handling."
+sleep 5
+echo "[*] Discovering vulnerabilities in virtio-gpu error handling."
+sleep 5
+python3 hunter.py --scan virtio-gpu
+echo "[*] Discovering vulnerabilities in virtio-scsi error handling."
+sleep 5
+python3 hunter.py --scan virtio-scsi
+echo "[*] Discovering vulnerabilities in virtio-crypto error handling."
+sleep 5
+python3 hunter.py --scan virtio-crypto
+echo "[*] Discovering vulnerabilities in vmware-svga error handling."
+sleep 5
+python3 hunter.py --scan vmware-svga
+echo "[*] Discovering vulnerabilities in ahci error handling."
+sleep 5
+python3 hunter.py --scan ahci
+echo "[*] Discovering vulnerabilities in nvme error handling."
+sleep 5
+python3 hunter.py --scan nvme
+echo "[*] Discovering vulnerabilities in e1000 error handling."
+sleep 5
+python3 hunter.py --scan e1000
+echo "[*] Discovering vulnerabilities in usb-xhc error handling."
+sleep 5
+python3 hunter.py --scan usb-xhc
+sleep 5
+echo "[*] All tasks completed."
+Sleep 5
+echo "[*] You can find the results in /opt/vuln-hunter/workdir/reports/"
+sleep 5
+echo "[*] Checking dmesg results."
+Sleep 5
+dmesg -c
