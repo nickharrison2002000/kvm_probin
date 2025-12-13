@@ -17,34 +17,34 @@ CFLAGS_user := -O2 -Wall -Wextra -I.
 all: module prober
 
 module:
-                @echo "Building kernel module from $(MODULE_SRC)..."
-                $(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
+	@echo "Building kernel module from $(MODULE_SRC)..."
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
 
 prober: $(PROBER_EXE)
 
 $(PROBER_EXE): $(PROBER_SRC)
-                @echo "Building userland prober from $(PROBER_SRC)..."
-                $(CC) $(CFLAGS_user) -o $@ $^
+	@echo "Building userland prober from $(PROBER_SRC)..."
+	$(CC) $(CFLAGS_user) -o $@ $^
 
 clean:
-                @echo "Cleaning build artifacts..."
-                $(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
-                rm -f $(PROBER_EXE) *.o .*.cmd *.mod.c *.mod *.ko modules.order Module.symvers
+	@echo "Cleaning build artifacts..."
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
+	rm -f $(PROBER_EXE) *.o .*.cmd *.mod.c *.mod *.ko modules.order Module.symvers
 
 install-module: module
-                sudo insmod $(MODULE_NAME).ko
-                sudo chmod 666 /dev/kvm_probe_dev
+	sudo insmod $(MODULE_NAME).ko
+	sudo chmod 666 /dev/kvm_probe_dev
 
 uninstall-module:
-                -sudo rmmod $(MODULE_NAME) 2>/dev/null || true
-                -sudo rm -f /dev/kvm_probe_dev 2>/dev/null || true
+	-sudo rmmod $(MODULE_NAME) 2>/dev/null || true
+	-sudo rm -f /dev/kvm_probe_dev 2>/dev/null || true
 
 load: install-module
 
 unload: uninstall-module
 
 install: all install-module
-                @echo "Toolkit installed and loaded"
+	@echo "Toolkit installed and loaded"
 
 .PHONY: all module prober clean install-module uninstall-module load unload install
 

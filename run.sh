@@ -6,6 +6,9 @@ echo "[*] clearing dmesg"
 sleep 5
 dmesg -c
 
+echo "[*] Installing necessary packages."
+sleep 5
+apt-get install make python3-venv python3-dev ninja-build pkg-config build-essential libglib2.0-dev libpixman-1-dev libfdt-dev zlib1g-dev libsdl2-dev libslirp-dev libcap-ng-dev libattr1-dev flex bison sudo git make gcc gdb tar pip xxd binutils linux-compiler-gcc-12-x86 linux-kbuild-6.1 wget lld llvm gcc-12-plugin-dev clang zlib1g-dev -y
 
 echo "[*] Setting up kernel parameters for AHCI exploit..."
 sleep 5
@@ -64,10 +67,6 @@ else
     echo "[!] /dev/mem is not writable. Root access required."
 fi
 
-echo "[*] Installing necessary packages."
-sleep 5
-apt-get install objdump readelf nm python3-venv python3-dev ninja-build pkg-config build-essential libglib2.0-dev libpixman-1-dev libfdt-dev zlib1g-dev libsdl2-dev libslirp-dev libcap-ng-dev libattr1-dev flex bison sudo git make gcc gdb tar pip xxd binutils linux-compiler-gcc-12-x86 linux-kbuild-6.1 wget lld llvm gcc-12-plugin-dev clang zlib1g-dev -y
-
 # Check for required tools
 echo "[*] Checking for required tools..."
 for tool in python3 objdump readelf nm; do
@@ -92,7 +91,7 @@ echo 0 | sudo tee /proc/sys/kernel/randomize_va_space
 
 echo "[*] Setting up prober."
 sleep 5
-cd /root/prober
+cd /root/kvm_probin/prober
 make
 make install
 cp kvm_prober /bin
@@ -101,7 +100,7 @@ sleep 5
 
 echo "[*] Setting up workspace."
 sleep 5
-cd /root/hunter
+cd /root/kvm_probin/hunter
 sleep 5
 python3 vuln_hunter.py --setup --workdir /opt/vuln-hunter
 
