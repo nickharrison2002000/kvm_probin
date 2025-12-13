@@ -94,7 +94,7 @@ sleep 5
 cd /root/kvm_probin/prober
 make
 make install
-cp kvm_prober /bin
+cp kvm_prober /usr/bin
 kvm_prober
 sleep 5
 
@@ -115,9 +115,6 @@ echo "[*] Initiating clean slate protocol."
 sleep 5
 dmesg -c
 echo "[*] Preparing variouse kvm/qemu device emulation tests on error handling."
-sleep 5
-python3 vuln_hunter.py --setup
-echo "[*] Setup complete."
 sleep 5
 echo "[*] Discovering vulnerabilities in virtio-gpu error handling."
 sleep 5
@@ -140,9 +137,9 @@ python3 vuln_hunter.py --scan nvme
 echo "[*] Discovering vulnerabilities in e1000 error handling."
 sleep 5
 python3 vuln_hunter.py --scan e1000
-echo "[*] Discovering vulnerabilities in usb-xhc error handling."
+echo "[*] Discovering vulnerabilities in usb-xhci error handling."
 sleep 5
-python3 vuln_hunter.py --scan usb-xhc
+python3 vuln_hunter.py --scan usb-xhci
 sleep 5
 echo "[*] All tasks completed."
 sleep 5
@@ -152,17 +149,20 @@ dmesg -c
 echo "[*] Preparing to run hunter.py."
 sleep 5
 python3 hunter.py 
-echo "[*] Running hunter.py --trigger option."
+echo "[*] Running hunter.py --test-trigger option."
 sleep 5
-python3 hunter.py --trigger
+python3 hunter.py --test-trigger --debug
 echo "[*] All tasks finished. Checking dmesg again"
 sleep 5
 dmesg -c
 Sleep 5
-echo "[*] Running hunter2.py."
+echo "[*] Running hunter2.py --debug."
+sleep 5
+python3 hunter2.py --debug
+sleep 5
+echo "[*] Running hunter2.py with --test-trigger --debug."
 sleep 5
 python3 hunter2.py --test-trigger --debug
-sleep 5
 echo "[*] All tasks finished. Checking dmesg again"
 sleep 5
 echo "[*] Final dmesg output:"
