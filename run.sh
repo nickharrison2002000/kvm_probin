@@ -147,3 +147,14 @@ sleep 5
 echo "[*] Checking dmesg results."
 Sleep 5
 dmesg -c
+Sleep 5
+echo "[*] Running hunter2.py."
+python3 hunter2.py --analyze /opt/vuln-hunter/workdir/reports/ --output /opt/vuln-hunter/final_report.txt
+echo "[*] Running hunter2.py with --trigger option."
+sleep 5
+python3 hunter2.py --trigger
+echo "[*] All tasks finished. Checking dmesg again"
+sleep 5
+dmesg -c
+echo "[*] Finished."
+
