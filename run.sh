@@ -106,6 +106,7 @@ python3 vuln_hunter.py --setup --workdir /opt/vuln-hunter
 
 cd /opt/vuln-hunter/qemu/build
 make install
+cp qemu-system-x86_64 /usr/bin/ 
 cd /opt/vuln-hunter/A*
 make install
 cd /root/kvm_probin/hunter
@@ -115,45 +116,56 @@ sleep 5
 dmesg -c
 echo "[*] Preparing variouse kvm/qemu device emulation tests on error handling."
 sleep 5
+python3 vuln_hunter.py --setup
+echo "[*] Setup complete."
+sleep 5
 echo "[*] Discovering vulnerabilities in virtio-gpu error handling."
 sleep 5
-python3 hunter.py --scan virtio-gpu
+python3 vuln_hunter.py --scan virtio-gpu
 echo "[*] Discovering vulnerabilities in virtio-scsi error handling."
 sleep 5
-python3 hunter.py --scan virtio-scsi
+python3 vuln_hunter.py --scan virtio-scsi
 echo "[*] Discovering vulnerabilities in virtio-crypto error handling."
 sleep 5
-python3 hunter.py --scan virtio-crypto
+python3 vuln_hunter.py --scan virtio-crypto
 echo "[*] Discovering vulnerabilities in vmware-svga error handling."
 sleep 5
-python3 hunter.py --scan vmware-svga
+python3 vuln_hunter.py --scan vmware-svga
 echo "[*] Discovering vulnerabilities in ahci error handling."
 sleep 5
-python3 hunter.py --scan ahci
+python3 vuln_hunter.py --scan ahci
 echo "[*] Discovering vulnerabilities in nvme error handling."
 sleep 5
-python3 hunter.py --scan nvme
+python3 vuln_hunter.py --scan nvme
 echo "[*] Discovering vulnerabilities in e1000 error handling."
 sleep 5
-python3 hunter.py --scan e1000
+python3 vuln_hunter.py --scan e1000
 echo "[*] Discovering vulnerabilities in usb-xhc error handling."
 sleep 5
-python3 hunter.py --scan usb-xhc
+python3 vuln_hunter.py --scan usb-xhc
 sleep 5
 echo "[*] All tasks completed."
-Sleep 5
-echo "[*] You can find the results in /opt/vuln-hunter/workdir/reports/"
 sleep 5
 echo "[*] Checking dmesg results."
 Sleep 5
 dmesg -c
+echo "[*] Preparing to run hunter.py."
+sleep 5
+python3 hunter.py 
+echo "[*] Running hunter.py --trigger option."
+sleep 5
+python3 hunter.py --trigger
+echo "[*] All tasks finished. Checking dmesg again"
+sleep 5
+dmesg -c
 Sleep 5
 echo "[*] Running hunter2.py."
-python3 hunter2.py --analyze /opt/vuln-hunter/workdir/reports/ --output /opt/vuln-hunter/final_report.txt
-echo "[*] Running hunter2.py with --trigger option."
 sleep 5
-python3 hunter2.py --trigger
+python3 hunter2.py --test-trigger --debug
+sleep 5
 echo "[*] All tasks finished. Checking dmesg again"
+sleep 5
+echo "[*] Final dmesg output:"
 sleep 5
 dmesg -c
 echo "[*] Finished."

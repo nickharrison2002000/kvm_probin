@@ -11,7 +11,7 @@ FULLY AUTOMATIC - NO HARDCODED OFFSETS
 - Discovers gadgets automatically
 
 USAGE:
-    sudo python3 ahci_exploit.py [--test-trigger] [--debug]
+    sudo python3 hunter2.py [--test-trigger] [--debug]
 """
 
 import struct
