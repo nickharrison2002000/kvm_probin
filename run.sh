@@ -149,10 +149,10 @@ Sleep 5
 dmesg -c
 echo "[*] Preparing to run hunter.py."
 sleep 5
-python3 hunter.py 
+python3 hunter3.py --test-trigger --debug --monitor
 echo "[*] Running hunter.py --test-trigger option."
 sleep 5
-python3 hunter.py --test-trigger --debug
+python3 hunter3.py --payload disable_smep_smap --monitor
 echo "[*] All tasks finished. Checking dmesg again"
 sleep 5
 dmesg -c
