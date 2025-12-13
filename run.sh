@@ -2,9 +2,9 @@
 #!/bin/bash
 
 
-echo "[*] clearing dmesg"
+echo "[*] clearing dmesg and sharing ahci/virtio/kvm kernel info."
 sleep 5
-dmesg -c
+dmesg -c | grep -i -E 'ahci|virtio|kvm'
 
 echo "[*] Installing necessary packages."
 sleep 5
