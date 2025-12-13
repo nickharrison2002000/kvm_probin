@@ -26,9 +26,9 @@ import ctypes
 
 GUEST_MEM_SIZE = 0x10000000
 FAKE_CHUNK_SIZE = 0x290
-SPRAY_COUNT = 1000
-RETRY_COUNT = 3
-TIMEOUT_SEC = 2
+SPRAY_COUNT = 100
+RETRY_COUNT = 1
+TIMEOUT_SEC = 1
 
 # ============================================================================
 # X86-64 SHELLCODE PAYLOADS

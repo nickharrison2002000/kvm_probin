@@ -106,7 +106,7 @@ sleep 5
 cd /opt/vuln-hunter/qemu/build
 make 
 make install
-cp qemu-system-x86_64 /usr/bin/ 
+cp /opt/vuln-hunter/qemu/build/qemu-system-x86_64 /usr/bin/ 
 cd /opt/vuln-hunter/A*
 make 
 make install
@@ -145,7 +145,7 @@ sleep 5
 echo "[*] All tasks completed."
 sleep 5
 echo "[*] Checking dmesg results."
-Sleep 5
+sleep 5
 dmesg -c
 echo "[*] Preparing to run hunter.py."
 sleep 5
@@ -156,7 +156,7 @@ python3 hunter3.py --payload disable_smep_smap --monitor
 echo "[*] All tasks finished. Checking dmesg again"
 sleep 5
 dmesg -c
-Sleep 5
+sleep 5
 echo "[*] Running hunter2.py --debug."
 sleep 5
 python3 hunter2.py --debug
