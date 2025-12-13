@@ -104,6 +104,12 @@ cd /root/kvm_probin/hunter
 sleep 5
 python3 vuln_hunter.py --setup --workdir /opt/vuln-hunter
 
+cd /opt/vuln-hunter/qemu/build
+make install
+cd /opt/vuln-hunter/A*
+make install
+cd /root/kvm_probin/hunter
+
 echo "[*] Discovering vulnerabilities in kvm/qemu error handling."
 sleep 5
 python3 hunter.py
