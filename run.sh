@@ -1,6 +1,4 @@
-
 #!/bin/bash
-
 
 echo "[*] clearing dmesg and sharing ahci/virtio/kvm kernel info."
 sleep 5
