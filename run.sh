@@ -100,12 +100,15 @@ echo "[*] Setting up workspace."
 sleep 5
 cd /root/kvm_probin/hunter
 sleep 5
-python3 vuln_hunter.py --setup --workdir /opt/vuln-hunter
-
+# python3 vuln_hunter.py --setup-simple --workdir /opt/vuln-hunter
+python3 vuln_hunter.py --setup-simple
+sleep 5
 cd /opt/vuln-hunter/qemu/build
+make 
 make install
 cp qemu-system-x86_64 /usr/bin/ 
 cd /opt/vuln-hunter/A*
+make 
 make install
 cd /root/kvm_probin/hunter
 
