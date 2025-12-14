@@ -64,7 +64,7 @@ class KVMProberMemory:
             return False
 
         try:
-            result = subprocess.run([self.kvm_prober, 'read_phys', '0x1000', '16'],
+            result = subprocess.run([self.kvm_prober, 'read_phys', '0x632cf9a8', '64'],
                                   capture_output=True, text=True, timeout=2)
             if result.returncode == 0 and 'Driver initialized' in result.stdout:
                 log_success("kvm_prober is working!")
