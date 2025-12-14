@@ -451,8 +451,6 @@ static void disable_smep(void) {
     unsigned long new_cr4 = current_cr4 & ~(1UL << 20);  // Clear SMEP bit (20)
     my_write_cr4(new_cr4);
     g_smep_disabled = true;
-    printk(KERN_WARNING "%s: SMEP DISABLED! (CR4: 0x%lx -> 0x%lx)\n",
-           DRIVER_NAME, current_cr4, new_cr4);
 #endif
 }
 
@@ -463,8 +461,6 @@ static void enable_smep(void) {
     unsigned long new_cr4 = current_cr4 | (1UL << 20);  // Set SMEP bit (20)
     my_write_cr4(new_cr4);
     g_smep_disabled = false;
-    printk(KERN_WARNING "%s: SMEP ENABLED! (CR4: 0x%lx -> 0x%lx)\n",
-           DRIVER_NAME, current_cr4, new_cr4);
 #endif
 }
 
@@ -476,10 +472,10 @@ static void disable_smap(void) {
     unsigned long new_cr4 = current_cr4 & ~(1UL << 21);  // Clear SMAP bit (21)
     my_write_cr4(new_cr4);
     g_smap_disabled = true;
-    printk(KERN_WARNING "%s: SMAP DISABLED! (CR4: 0x%lx -> 0x%lx)\n",
-           DRIVER_NAME, current_cr4, new_cr4);
 #endif
 }
+
+
 
 /* Enable SMAP by setting bit 21 of CR4 */
 static void enable_smap(void) {
@@ -488,8 +484,6 @@ static void enable_smap(void) {
     unsigned long new_cr4 = current_cr4 | (1UL << 21);  // Set SMAP bit (21)
     my_write_cr4(new_cr4);
     g_smap_disabled = false;
-    printk(KERN_WARNING "%s: SMAP ENABLED! (CR4: 0x%lx -> 0x%lx)\n",
-           DRIVER_NAME, current_cr4, new_cr4);
 #endif
 }
 
@@ -501,8 +495,6 @@ static void disable_wp(void) {
     unsigned long new_cr0 = current_cr0 & ~(1UL << 16);  // Clear WP bit (16)
     my_write_cr0(new_cr0);
     g_wp_disabled = true;
-    printk(KERN_WARNING "%s: WP DISABLED! (CR0: 0x%lx -> 0x%lx)\n",
-           DRIVER_NAME, current_cr0, new_cr0);
 #endif
 }
 
@@ -513,8 +505,6 @@ static void enable_wp(void) {
     unsigned long new_cr0 = current_cr0 | (1UL << 16);  // Set WP bit (16)
     my_write_cr0(new_cr0);
     g_wp_disabled = false;
-    printk(KERN_WARNING "%s: WP ENABLED! (CR0: 0x%lx -> 0x%lx)\n",
-           DRIVER_NAME, current_cr0, new_cr0);
 #endif
 }
 
@@ -535,8 +525,6 @@ static void enable_nx(void) {
         u64 new_efer = current_efer | EFER_NXE;  // Set NXE bit (11)
         my_wrmsr(MSR_EFER, new_efer);
         g_nx_enabled = true;
-        printk(KERN_WARNING "%s: NX ENABLED! (EFER: 0x%llx -> 0x%llx)\n",
-               DRIVER_NAME, current_efer, new_efer);
     }
 #endif
 }
@@ -557,9 +545,6 @@ static void disable_nx(void) {
 static void my_read_cr0_debug(void) {
 #ifdef CONFIG_X86
     unsigned long cr0 = my_read_cr0();
-    printk(KERN_INFO "%s: CR0 = 0x%lx\n", DRIVER_NAME, cr0);
-    printk(KERN_INFO "%s: CR0.WP (bit 16) = %d\n",
-           DRIVER_NAME, (cr0 & (1UL << 16)) ? 1 : 0);
 #endif
 }
 
@@ -590,21 +575,15 @@ static void restore_protections(void) {
 #ifdef CONFIG_X86
     if (g_smep_disabled || g_smap_disabled) {
         my_write_cr4(g_original_cr4);
-        printk(KERN_INFO "%s: CR4 protections restored (CR4: 0x%lx)\n",
-               DRIVER_NAME, g_original_cr4);
         g_smep_disabled = false;
         g_smap_disabled = false;
     }
     if (g_wp_disabled) {
         my_write_cr0(g_original_cr0);
-        printk(KERN_INFO "%s: WP restored (CR0: 0x%lx)\n",
-               DRIVER_NAME, g_original_cr0);
         g_wp_disabled = false;
     }
     if (g_nx_enabled) {
         my_wrmsr(MSR_EFER, g_original_efer);
-        printk(KERN_INFO "%s: NX restored to original state (EFER: 0x%llx)\n",
-               DRIVER_NAME, g_original_efer);
         g_nx_enabled = false;
     }
 #endif
@@ -916,10 +895,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
 
     /* Only log IOCTL for important/extreme operations */
     switch (cmd) {
-        case IOCTL_DISABLE_SMEP:
-        case IOCTL_DISABLE_SMAP:
-        case IOCTL_DISABLE_WP:
-        case IOCTL_ENABLE_NX:
         case IOCTL_DISABLE_NX:
         case IOCTL_LOOKUP_SYMBOL:
         case IOCTL_GET_KASLR_SLIDE:
@@ -929,9 +904,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
         case IOCTL_WRITE_EFER:
         case IOCTL_WRITE_PHYSICAL:
         case IOCTL_WRITE_KERNEL_MEM:
-        case IOCTL_ENABLE_SMEP:
-        case IOCTL_ENABLE_SMAP:
-        case IOCTL_ENABLE_WP:
         case IOCTL_WRITE_CR0:
         case IOCTL_ESCALATE_PRIVILEGES:
             printk(KERN_DEBUG "%s: IOCTL cmd=0x%x\n", DRIVER_NAME, cmd);
@@ -1470,81 +1442,75 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             force_hypercall(); /* Quiet version */
             return 0;
 
-        case IOCTL_READ_CR4: {
+    case IOCTL_READ_CR4: {
 #ifdef CONFIG_X86
-            unsigned long cr4 = my_read_cr4();
-            return copy_to_user((void __user *)arg, &cr4, sizeof(cr4)) ? -EFAULT : 0;
+        unsigned long cr4 = my_read_cr4();
+        return copy_to_user((void __user *)arg, &cr4, sizeof(cr4)) ? -EFAULT : 0;
 #else
-            return -ENOSYS;
+        return -ENOSYS;
 #endif
-        }
+    }
 
-        case IOCTL_WRITE_CR4: {
+    case IOCTL_WRITE_CR4: {
 #ifdef CONFIG_X86
-            unsigned long cr4;
-            if (copy_from_user(&cr4, (void __user *)arg, sizeof(cr4))) {
-                return -EFAULT;
-            }
-            /* Log CR4 writes since they're security critical */
-            printk(KERN_WARNING "%s: CR4 WRITE: 0x%lx\n", DRIVER_NAME, cr4);
-            my_write_cr4(cr4);
-            return 0;
-#else
-            return -ENOSYS;
-#endif
+        unsigned long cr4;
+        if (copy_from_user(&cr4, (void __user *)arg, sizeof(cr4))) {
+            return -EFAULT;
         }
-
-        case IOCTL_READ_CR0: {
-#ifdef CONFIG_X86
-            unsigned long cr0 = my_read_cr0();
-            return copy_to_user((void __user *)arg, &cr0, sizeof(cr0)) ? -EFAULT : 0;
+        my_write_cr4(cr4);
+        return 0;
 #else
-            return -ENOSYS;
+        return -ENOSYS;
 #endif
+    }
+
+    case IOCTL_READ_CR0: {
+#ifdef CONFIG_X86
+        unsigned long cr0 = my_read_cr0();
+        return copy_to_user((void __user *)arg, &cr0, sizeof(cr0)) ? -EFAULT : 0;
+#else
+        return -ENOSYS;
+#endif
+    }
+
+    case IOCTL_WRITE_CR0: {
+#ifdef CONFIG_X86
+        unsigned long cr0;
+        if (copy_from_user(&cr0, (void __user *)arg, sizeof(cr0))) {
+            return -EFAULT;
         }
-
-        case IOCTL_WRITE_CR0: {
-#ifdef CONFIG_X86
-            unsigned long cr0;
-            if (copy_from_user(&cr0, (void __user *)arg, sizeof(cr0))) {
-                return -EFAULT;
-            }
-            /* Log CR0 writes since they're security critical */
-            printk(KERN_WARNING "%s: CR0 WRITE: 0x%lx\n", DRIVER_NAME, cr0);
-            my_write_cr0(cr0);
-            return 0;
+        my_write_cr0(cr0);
+        return 0;
 #else
-            return -ENOSYS;
+        return -ENOSYS;
 #endif
+    }
+
+    case IOCTL_READ_MSR: {
+#ifdef CONFIG_X86
+        struct msr_data msr_req;
+        if (copy_from_user(&msr_req, (void __user *)arg, sizeof(msr_req))) {
+            return -EFAULT;
         }
-
-        case IOCTL_READ_MSR: {
-#ifdef CONFIG_X86
-            struct msr_data msr_req;
-            if (copy_from_user(&msr_req, (void __user *)arg, sizeof(msr_req))) {
-                return -EFAULT;
-            }
-            msr_req.value = my_rdmsr(msr_req.msr);
-            return copy_to_user((void __user *)arg, &msr_req, sizeof(msr_req)) ? -EFAULT : 0;
+        msr_req.value = my_rdmsr(msr_req.msr);
+        return copy_to_user((void __user *)arg, &msr_req, sizeof(msr_req)) ? -EFAULT : 0;
 #else
-            return -ENOSYS;
+        return -ENOSYS;
 #endif
+    }
+
+    case IOCTL_WRITE_MSR: {
+#ifdef CONFIG_X86
+        struct msr_data msr_req;
+        if (copy_from_user(&msr_req, (void __user *)arg, sizeof(msr_req))) {
+            return -EFAULT;
         }
-
-        case IOCTL_WRITE_MSR: {
-#ifdef CONFIG_X86
-            struct msr_data msr_req;
-            if (copy_from_user(&msr_req, (void __user *)arg, sizeof(msr_req))) {
-                return -EFAULT;
-            }
-            /* Log MSR writes since they're very dangerous */
-            printk(KERN_WARNING "%s: MSR WRITE: 0x%x = 0x%llx\n",
-                   DRIVER_NAME, msr_req.msr, msr_req.value);
-            my_wrmsr(msr_req.msr, msr_req.value);
-            return 0;
+        my_wrmsr(msr_req.msr, msr_req.value);
+        return 0;
 #else
-            return -ENOSYS;
+        return -ENOSYS;
 #endif
+    }
         }
 
         case IOCTL_READ_PHYSICAL: {

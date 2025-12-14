@@ -156,14 +156,14 @@ sleep 5
 echo "[*] Clean slate protocol"
 sleep 5
 dmesg -c
-sleep 5
-echo "[*] Running hunter.py"
-python3 hunter.py --monitor --payload disable_smep_smap
-sleep 5
-echo "[*] Clean slate protocol"
-sleep 5
-dmesg -c
-sleep 5
+ #sleep 5
+# echo "[*] Running hunter.py"
+# python3 hunter.py --monitor --payload disable_smep_smap
+# sleep 5
+# echo "[*] Clean slate protocol"
+# sleep 5
+# dmesg -c
+# sleep 5
 # echo "[*] Running hunter2.py"
 # python3 hunter2.py --debug
 sleep 5
