@@ -1125,7 +1125,7 @@ void virt_to_phys_scan_fast(unsigned long target_phys, unsigned long start_va, u
 
 void print_help(void) {
     printf("╔═══════════════════════════════════════════════════════════════════════╗\n");
-    printf("║                   KVMCTF EXPLOITATION TOOL - v2.0                      ║\n");
+    printf("║                   KVMCTF EXPLOITATION TOOL - v2.0                     ║\n");
     printf("╚═══════════════════════════════════════════════════════════════════════╝\n\n");
 
     printf("ENHANCED MEMORY READ/SCAN OPERATIONS:\n");
@@ -1207,7 +1207,7 @@ void print_help(void) {
     printf("\n");
 
     printf("╔═══════════════════════════════════════════════════════════════════════╗\n");
-    printf("║                            WARNING                                     ║\n");
+    printf("║                            WARNING                                    ║\n");
     printf("║  These operations can CRASH, CORRUPT, or DESTABILIZE the host system. ║\n");
     printf("║  Use ONLY on dedicated test systems with appropriate authorization.   ║\n");
     printf("╚═══════════════════════════════════════════════════════════════════════╝\n");
