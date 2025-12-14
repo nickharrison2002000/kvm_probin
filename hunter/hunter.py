@@ -26,8 +26,8 @@ import ctypes
 
 GUEST_MEM_SIZE = 0x10000000
 FAKE_CHUNK_SIZE = 0x290
-SPRAY_COUNT = 1000
-RETRY_COUNT = 3
+SPRAY_COUNT = 10
+RETRY_COUNT = 0
 TIMEOUT_SEC = 2
 
 # ============================================================================

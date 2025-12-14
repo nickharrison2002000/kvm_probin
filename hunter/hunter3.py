@@ -26,8 +26,8 @@ import ctypes
 
 GUEST_MEM_SIZE = 0x10000000
 FAKE_CHUNK_SIZE = 0x290
-SPRAY_COUNT = 100
-RETRY_COUNT = 1
+SPRAY_COUNT = 10
+RETRY_COUNT = 0
 TIMEOUT_SEC = 1
 
 # ============================================================================
@@ -923,4 +923,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    parser.
