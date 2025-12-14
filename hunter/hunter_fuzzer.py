@@ -466,7 +466,7 @@ def parse_args():
     import argparse
     parser = argparse.ArgumentParser(description='AHCI Fuzzer Payload Exploitation')
     parser.add_argument('--kvm-prober', default='/root/kvm_probin/prober/kvm_prober',
-                       help='Path to kvm_prober binary')
+                       help='Path to ahci_exploit.bin')
     parser.add_argument('--payload', required=True,
                        help='Path to fuzzer binary payload')
     parser.add_argument('--debug', action='store_true',

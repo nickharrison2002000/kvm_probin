@@ -150,6 +150,13 @@ echo "[*] Clean slate protocol"
 sleep 5
 dmesg -c
 sleep 5
+echo "[*] Running hunter_fuzzer.py"
+python3 hunter_fuzzer.py --debug --payload ahci_exploit.bin
+sleep 5
+echo "[*] Clean slate protocol"
+sleep 5
+dmesg -c
+sleep 5
 echo "[*] Running hunter.py"
 python3 hunter.py --monitor --payload disable_smep_smap
 sleep 5
@@ -166,13 +173,6 @@ dmesg -c
 sleep 5
 echo "[*] Running hunter3.py"
 python3 hunter3.py --debug --monitor --payload disable_smep_smap
-sleep 5
-echo "[*] Clean slate protocol"
-sleep 5
-dmesg -c
-sleep 5
-echo "[*] Running hunter4.py"
-python3 hunter4.py --debug --payload
 sleep 5
 echo "[*] Clean slate protocol"
 sleep 5
