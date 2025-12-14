@@ -442,11 +442,9 @@ class GuestMemory:
             return False
 
         test_addresses = [
-            0x475ed0,
-            0x1153e10,
-            0x343160,
-            0x523220,
-            0xf163d0,
+            0x13e8000,    # ★ Primary (proven)
+            0x13e9000,    # +4KB (same region)
+            0x1400000,    # +20MB (extended heap)
         ]
 
         for addr in test_addresses:
