@@ -988,10 +988,11 @@ class AddressResolver:
         else:
             # Fallback: GOT is typically at these common offsets
             common_got_offsets = [
-                0x200000,  # Typical for large binaries like QEMU
-                0x3000,    # Typical for small binaries
-                0x2000,    # Alternative
-                0x4000,    # Alternative
+                    0x475ed0,
+                    0x1153e10,
+                    0x343160,
+                    0x523220,
+                    0xf163d0,   # Alternative
             ]
             
             got_addr = None

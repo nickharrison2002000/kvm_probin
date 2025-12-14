@@ -442,10 +442,11 @@ class GuestMemory:
             return False
 
         test_addresses = [
-            0x13e8000,
-            0x1000000,
-            0x2000000,
-            0x4000000,
+            0x475ed0,
+            0x1153e10,
+            0x343160,
+            0x523220,
+            0xf163d0,
         ]
 
         for addr in test_addresses:

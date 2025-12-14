@@ -457,10 +457,11 @@ class GuestMemory:
             return False
 
         test_addresses = [
-            0x13e8000,
-            0x1000000,
-            0x2000000,
-            0x4000000,
+            0x475ed0,
+            0x1153e10,
+            0x343160,
+            0x523220,
+            0xf163d0,
         ]
 
         for addr in test_addresses:
@@ -940,7 +941,7 @@ def main():
     # Adjust for safe mode
     spray_count = args.spray_count
     if args.safe_mode:
-        spray_count = 100
+        spray_count = 10
         log_warning("SAFE MODE ENABLED - Using reduced spray count (100 chunks)")
     
     # Check if we can run kvm_prober

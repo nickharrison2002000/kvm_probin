@@ -100,8 +100,8 @@ echo "[*] Setting up workspace."
 sleep 5
 cd /root/kvm_probin/hunter
 sleep 5
-# python3 vuln_hunter.py --setup-simple --workdir /opt/vuln-hunter
-python3 vuln_hunter.py --setup-simple
+# python3 setup.py --setup-simple --workdir /opt/vuln-hunter
+python3 setup.py --setup-simple
 sleep 5
 cd /opt/vuln-hunter/qemu/build
 make 
@@ -119,55 +119,62 @@ echo "[*] Preparing variouse kvm/qemu device emulation tests on error handling."
 sleep 5
 echo "[*] Discovering vulnerabilities in virtio-gpu error handling."
 sleep 5
-python3 vuln_hunter.py --scan virtio-gpu
+python3 setup.py --scan virtio-gpu
 echo "[*] Discovering vulnerabilities in virtio-scsi error handling."
 sleep 5
-python3 vuln_hunter.py --scan virtio-scsi
+python3 setup.py --scan virtio-scsi
 echo "[*] Discovering vulnerabilities in virtio-crypto error handling."
 sleep 5
-python3 vuln_hunter.py --scan virtio-crypto
+python3 setup.py --scan virtio-crypto
 echo "[*] Discovering vulnerabilities in vmware-svga error handling."
 sleep 5
-python3 vuln_hunter.py --scan vmware-svga
+python3 setup.py --scan vmware-svga
 echo "[*] Discovering vulnerabilities in ahci error handling."
 sleep 5
-python3 vuln_hunter.py --scan ahci
+python3 setup.py --scan ahci
 echo "[*] Discovering vulnerabilities in nvme error handling."
 sleep 5
-python3 vuln_hunter.py --scan nvme
+python3 setup.py --scan nvme
 echo "[*] Discovering vulnerabilities in e1000 error handling."
 sleep 5
-python3 vuln_hunter.py --scan e1000
+python3 setup.py --scan e1000
 echo "[*] Discovering vulnerabilities in usb-xhci error handling."
 sleep 5
-python3 vuln_hunter.py --scan usb-xhci
+python3 setup.py --scan usb-xhci
 sleep 5
 echo "[*] All tasks completed."
 sleep 5
-echo "[*] Checking dmesg results."
-sleep 5
-dmesg -c
-echo "[*] Preparing to run hunter.py."
-sleep 5
-python3 hunter3.py --test-trigger --debug --monitor
-echo "[*] Running hunter.py --test-trigger option."
-sleep 5
-python3 hunter3.py --payload disable_smep_smap --monitor
-echo "[*] All tasks finished. Checking dmesg again"
+echo "[*] Preparing bin file."
+python3 binmaker.py
+echo "[*] Clean slate protocol"
 sleep 5
 dmesg -c
 sleep 5
-echo "[*] Running hunter2.py --debug."
+echo "[*] Running hunter.py"
+python3 hunter.py --monitor --payload disable_smep_smap
+sleep 5
+echo "[*] Clean slate protocol"
+sleep 5
+dmesg -c
 sleep 5
 python3 hunter2.py --debug
 sleep 5
-echo "[*] Running hunter2.py with --test-trigger --debug."
-sleep 5
-python3 hunter2.py --test-trigger --debug
-echo "[*] All tasks finished. Checking dmesg again"
-sleep 5
-echo "[*] Final dmesg output:"
+echo "[*] Clean slate protocol"
 sleep 5
 dmesg -c
-echo "[*] Finished."
+sleep 5
+python3 hunter3.py --debug --monitor --payload disable_smep_smap
+sleep 5
+echo "[*] Clean slate protocol"
+sleep 5
+dmesg -c
+sleep 5
+python3 hunter4.py --debug --payload
+sleep 5
+echo "[*] Clean slate protocol"
+sleep 5
+dmesg -c
+sleep 5
+echo "[*] Done"
+
 
