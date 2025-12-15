@@ -213,7 +213,7 @@ static int contains_trigger(unsigned char *buf, size_t buf_len, const char *trig
     }
     
     /* Try hex match (little-endian) */
-    unsigned char hex_bytes[256];
+    unsigned char hex_bytes[16];
     int hex_len = hex_to_bytes(trigger, hex_bytes, sizeof(hex_bytes));
     
     if (hex_len > 0 && (size_t)hex_len <= buf_len) {
@@ -1458,11 +1458,11 @@ void adaptive_dma_leak_fuzz(int pages, int corruption) {
     }
     
     printf("=== ADAPTIVE DMA LEAK FUZZER ===\n");
-    printf("[+] Pages: %d, Starting corruption: %d%%\n", pages, corruption_start);
+    printf("[+] Pages: %d, Starting corruption: %d%%\n", pages, corruption);
     
     if (pages <= 0 || pages > 16) pages = 8;
     
-    int corruption_level = corruption_start;
+    int corruption_level = corruption;
     
     for (int phase = 1; phase <= 5; phase++) {
         printf("\n[DMA PHASE %d] Corruption: %d%%\n", phase, corruption_level);
@@ -1554,12 +1554,12 @@ void progressive_memory_scan(unsigned long start_addr, unsigned long end_addr,
     
     printf("=== PROGRESSIVE MEMORY SCANNER ===\n");
     printf("[+] Range: 0x%lx - 0x%lx\n", start_addr, end_addr);
-    printf("[+] Phases: %d\n", phases);
+    printf("[+] Phases: %d, Step: 0x%lx\n", phases, step);
     
-    unsigned long step = initial_step;
+    unsigned long current_step = step;
     
     for (int phase = 1; phase <= phases; phase++) {
-        printf("\n[SCAN PHASE %d] Step size: 0x%lx\n", phase, step);
+        printf("\n[SCAN PHASE %d] Step size: 0x%lx\n", phase, current_step);
         
         int leaks_this_phase = 0;
         unsigned long addr = start_addr;
@@ -1572,7 +1572,7 @@ void progressive_memory_scan(unsigned long start_addr, unsigned long end_addr,
                 printf("[+] Found %d leaks at 0x%lx\n", found, addr);
             }
             
-            addr += step;
+            addr += current_step;
             scanned++;
             
             if (scanned % 100 == 0) {
@@ -1589,18 +1589,14 @@ void progressive_memory_scan(unsigned long start_addr, unsigned long end_addr,
         printf("[SCAN PHASE %d] Complete - Found %d leaks\n", phase, leaks_this_phase);
         
         /* Reduce step size for next phase (more granular) */
-        step = step / 2;
-        if (step < 0x1000) step = 0x1000; /* Minimum page size */
+        current_step = current_step / 2;
+        if (current_step < 0x1000) current_step = 0x1000; /* Minimum page size */
         
         sleep(1);
     }
     
     printf("\n[+] Progressive scan complete - Total leaks: %d\n", g_leak_count);
 }
-
-/* ========================================================================
- * ADD THESE NEW FUNCTIONS RIGHT HERE:
- * ======================================================================== */
 
 /* Show all detected leak candidates */
 void show_leak_candidates(void) {
@@ -2225,7 +2221,7 @@ int main(int argc, char *argv[]) {
         } else {
             unsigned long start = strtoul(argv[2], NULL, 0);
             unsigned long end = strtoul(argv[3], NULL, 0);
-            unsigned long step = (argc > 4) ? strtoul(argv[4], NULL, 0) :0x10000;
+            unsigned long step = (argc > 4) ? strtoul(argv[4], NULL, 0) : 0x10000;
             int phases = (argc > 5) ? atoi(argv[5]) : 5;
             progressive_memory_scan(start, end, step, phases);
         }
