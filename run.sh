@@ -150,6 +150,13 @@ echo "[*] Clean slate protocol"
 sleep 5
 dmesg -c
 sleep 5
+echo "[*] Running deadbeef_exploit.py"
+python3 deadbeef_exploit.py
+sleep 5
+echo "[*] Clean slate protocol"
+sleep 5
+dmesg -c
+sleep 5
 echo "[*] Running hunter_fuzzer.py"
 # python3 hunter_fuzzer.py --debug --monitor --test-trigger
 sleep 5
