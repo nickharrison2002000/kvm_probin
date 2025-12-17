@@ -6,7 +6,7 @@ dmesg -c | grep -i -E 'ahci|virtio|kvm'
 
 echo "[*] Installing necessary packages."
 sleep 5
-apt-get install make python3-venv python3-dev ninja-build pkg-config build-essential libglib2.0-dev libpixman-1-dev libfdt-dev zlib1g-dev libsdl2-dev libslirp-dev libcap-ng-dev libattr1-dev flex bison sudo git make gcc gdb tar pip xxd binutils linux-compiler-gcc-12-x86 linux-kbuild-6.1 wget lld llvm gcc-12-plugin-dev clang zlib1g-dev -y
+apt-get install make python3-venv python3-dev ninja-build pkg-config build-essential libglib2.0-dev libpixman-1-dev libfdt-dev zlib1g-dev libsdl2-dev libslirp-dev libcap-ng-dev libattr1-dev flex bison sudo git make gcc gdb tar pip xxd binutils linux-compiler-gcc-12-x86 linux-kbuild-6.1 wget lld llvm gcc-12-plugin-dev clang zlib1g-dev -y || true
 
 echo "[*] Setting up kernel parameters for AHCI exploit..."
 sleep 5
