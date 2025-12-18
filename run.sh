@@ -95,6 +95,10 @@ make install
 cp kvm_prober /usr/bin
 kvm_prober
 sleep 5
+make kvm_probe
+cp kvm_probe /usr/bin
+kvm_probe
+sleep 5
 
 echo "[*] Setting up workspace."
 sleep 5
