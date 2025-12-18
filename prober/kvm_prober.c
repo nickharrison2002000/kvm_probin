@@ -1648,7 +1648,7 @@ void reset_leak_candidates(void) {
 
 void print_help(void) {
     printf("╔═══════════════════════════════════════════════════════════════════════╗\n");
-    printf("║                   KVMCTF EXPLOITATION TOOL - v2.0                      ║\n");
+    printf("║                   KVMCTF EXPLOITATION TOOL - v2.0                     ║\n");
     printf("╚═══════════════════════════════════════════════════════════════════════╝\n\n");
     printf("\n");
 
@@ -1684,8 +1684,7 @@ void print_help(void) {
     printf("            Example: kvm_prober virt_to_phys 0xffff888000000000\n");
     printf("  trigger_hypercall                                        - Trigger default hypercall\n");
     printf("            Example: kvm_prober trigger_hypercall\n");
-    printf("  hypercall <nr> <a0> <a1> <a2> <a3>                       - Trigger hypercall\n");
-    printf("            Example: kvm_prober hypercall 42 1 2 3 4\n");
+    printf("  NOTE: Hypercalls are now automatically triggered after every operation\n");
     printf("  NOTE: SMEP/SMAP/WP are automatically disabled before all read/write ops\n");
     printf("\n");
 
@@ -1745,7 +1744,7 @@ void print_help(void) {
     printf("\n");
 
     printf("╔═══════════════════════════════════════════════════════════════════════╗\n");
-    printf("║                            WARNING                                     ║\n");
+    printf("║                            WARNING                                    ║\n");
     printf("║  These operations can CRASH, CORRUPT, or DESTABILIZE the host system. ║\n");
     printf("║  Use ONLY on dedicated test systems with appropriate authorization.   ║\n");
     printf("╚═══════════════════════════════════════════════════════════════════════╝\n");

