@@ -101,7 +101,7 @@ sleep 5
 cd /root/kvm_probin/hunter
 sleep 5
 # python3 setup.py --setup-simple --workdir /opt/vuln-hunter
-python3 setup.py --setup-simple
+python3 setup.py --setup-simple --workdir /opt/vuln-hunter
 sleep 5
 cd /opt/vuln-hunter/qemu/build
 make 
