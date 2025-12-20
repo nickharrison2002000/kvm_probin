@@ -61,9 +61,19 @@ make kvm_probe
 cp kvm_probe /usr/bin
 kvm_probe
 sleep 5
+make ptr
+cp ptr /usr/bin
+ptr
+sleep 5
+echo "[*] Running ptr."
+sleep 5
+ptr ept
+sleep 5
 dmesg -c
 sleep 5
-
+ptr write
+sleep 5
+dmesg -c
 sleep 5
 # Check current cmdline
 if grep -qw "nokaslr" /proc/cmdline; then
